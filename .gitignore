@@ -1,0 +1,8 @@
+project-pack/
+wiki-pack/
+backlog-pack/
+.issue-map
+.project-map
+node_modules/
+.env
+.DS_Store
