@@ -1,0 +1,55 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT       ||--o{ MERCHANT_ADMIN : "มีแอดมินหลายคน"
+    MERCHANT_ADMIN ||--o{ AUTH_SESSION : "ล็อกอินจากหลายเครื่อง"
+    CUSTOMER       ||--o{ AUTH_SESSION : "ล็อกอินจากหลายเครื่อง"
+    AUTH_SESSION   ||--o| AUTH_SESSION : "หมุนเป็นใบถัดไป"
+    AUTH_SESSION   ||--o{ AUTH_EVENT : "บันทึกทุกเหตุการณ์"
+
+    MERCHANT_ADMIN {
+        text id PK
+        text merchant_id FK
+        text email_normalized UK "NFC trim lowercase"
+        text password_hash "argon2id เท่านั้น"
+        timestamptz disabled_at "ปิดแล้วต้องเพิกถอน session"
+        timestamptz last_login_at
+    }
+    CUSTOMER {
+        text id PK
+        bytea tel_hash UK
+        timestamptz disabled_at
+    }
+    AUTH_SESSION {
+        text id PK
+        enum subject_kind "MERCHANT_ADMIN CUSTOMER"
+        text merchant_admin_id FK "คนใดคนหนึ่งเท่านั้น"
+        text customer_id FK "คนใดคนหนึ่งเท่านั้น"
+        text family_id "สายของการหมุน"
+        bytea refresh_token_hash UK "sha256 · ไม่เก็บ plaintext"
+        text parent_id UK "ใบหนึ่งมีลูกได้ใบเดียว"
+        timestamptz expires_at "ต้องหลัง created_at"
+        timestamptz used_at "ใช้หมุนแล้ว"
+        timestamptz revoked_at
+        enum revoked_reason "ว่างไม่ได้ถ้า revoked_at มีค่า"
+    }
+    LOGIN_ATTEMPT {
+        text id PK
+        bytea identifier_hash "ไม่เก็บอีเมลตรงๆ"
+        bytea ip_hash "ไม่เก็บ IP ตรงๆ"
+        boolean succeeded
+        text failure_code "ว่างเมื่อสำเร็จ"
+        timestamptz created_at
+    }
+    LOGIN_LOCKOUT {
+        bytea identifier_hash PK
+        timestamptz locked_until
+        int attempt_count
+    }
+    AUTH_EVENT {
+        text id PK
+        enum subject_kind
+        text subject_id
+        text kind "LOGIN_OK LOGIN_FAIL REFRESH LOGOUT REUSE_DETECTED"
+        text session_id FK
+        jsonb metadata
+    }

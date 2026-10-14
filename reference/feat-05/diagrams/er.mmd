@@ -1,0 +1,68 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT        ||--o{ POINT_TYPE : "ออก point"
+    POINT_TYPE      ||--|| POINT_TYPE_CHAIN : "ค่าคงที่ของ contract"
+    POINT_TYPE      ||--o{ POINT_BALANCE_BUCKET : "ยอดแยกตาม epoch"
+    POINT_TYPE      ||--o{ LEDGER_ENTRY : "บัญชีคู่"
+    CUSTOMER        ||--o{ POINT_BALANCE_BUCKET : "ถือยอด"
+    IDEMPOTENCY_KEY ||--o| OPERATION : "ชี้ไปที่"
+    OPERATION       ||--o{ OPERATION_STEP : "ชุดละ 100 คน"
+    OPERATION       ||--|| OUTBOX : "ปลุก worker"
+    OPERATION       ||--|| RESERVATION : "กันยอดไว้"
+    OPERATION       ||--o{ LEDGER_ENTRY : "ลงบัญชี"
+
+    POINT_TYPE_CHAIN {
+        text point_type_id PK
+        bytea contract_address UK
+        timestamptz genesis_at "จุดเริ่มนับ epoch"
+        int epoch_seconds
+        int validity_epochs
+    }
+    POINT_BALANCE_BUCKET {
+        text id PK
+        text point_type_id UK
+        enum holder_kind UK "MERCHANT CUSTOMER"
+        text holder_id UK
+        int epoch_index UK "หนึ่งก้อนต่อ epoch"
+        numeric amount "78,0 · base units"
+        timestamptz received_at
+        timestamptz expires_at "ต้องหลัง received_at"
+    }
+    RESERVATION {
+        text id PK
+        text operation_id FK
+        enum subject_type "POINT_BALANCE คือยอด ไม่ใช่ของชิ้นเดียว"
+        text subject_id "pointTypeId|kind|holderId"
+        numeric amount "78,0"
+        timestamptz released_at "ปล่อยได้เมื่องานจบเท่านั้น"
+    }
+    LEDGER_ENTRY {
+        text id PK
+        text operation_id FK
+        text point_type_id FK
+        enum direction "DEBIT CREDIT"
+        numeric amount "78,0"
+        text chain_event_id "ที่มาจาก chain"
+    }
+    OPERATION {
+        text id PK
+        enum kind "POINT_TRANSFER"
+        enum status "PENDING..FINALIZED"
+        text subject_id "point_type_id"
+        jsonb payload "รายชื่อผู้รับ"
+    }
+    OPERATION_STEP {
+        text id PK
+        text operation_id FK
+        int step_index UK "1 2 3"
+        int recipient_count "ไม่เกิน 100"
+        bigint nonce UK
+        bytea raw_tx "COMMIT ก่อน broadcast"
+        bytea tx_hash UK
+    }
+    OUTBOX {
+        text id PK
+        text operation_id FK
+        text topic "point.transfer.v1"
+        timestamptz sent_at
+    }

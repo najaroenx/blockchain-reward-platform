@@ -1,0 +1,24 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> ACTIVE : login สำเร็จ · ออก refresh token
+    ACTIVE --> ROTATED : refresh สำเร็จ · ออกใบลูก
+    ACTIVE --> LOGGED_OUT : ผู้ใช้กดออกจากระบบ
+    ACTIVE --> EXPIRED : เกิน 30 วัน
+    ACTIVE --> ADMIN_REVOKED : ปิดบัญชี หรือเปลี่ยนรหัสผ่าน
+    ROTATED --> COMPROMISED : มีคนเอาใบที่หมุนแล้วมาใช้อีก
+    COMPROMISED --> [*]
+    ROTATED --> [*]
+    LOGGED_OUT --> [*]
+    EXPIRED --> [*]
+    ADMIN_REVOKED --> [*]
+    note right of ROTATED
+        ใบนี้หมดหน้าที่แล้ว
+        แต่ยังเก็บไว้เพื่อจับการขโมย
+        ลบทิ้งเมื่อไหร่ ก็จับไม่ได้อีก
+    end note
+    note right of COMPROMISED
+        ไม่ได้ปฏิเสธแค่ request นี้
+        ทั้ง family ถูกเพิกถอนพร้อมกัน
+        ทุกเครื่องต้องล็อกอินใหม่
+    end note

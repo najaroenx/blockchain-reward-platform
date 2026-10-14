@@ -1,0 +1,71 @@
+sequenceDiagram
+    autonumber
+    actor Shop as ร้าน
+    participant Api as api
+    participant Db as postgres
+    participant Wrk as worker
+    participant Ch as chain
+    participant Idx as indexer
+
+    Note over Shop,Idx: ถอดรายการขาย · สอง tx ที่ต้องเรียงกัน
+
+    Shop->>Api: DELETE /v1/listings/lst_x<br/>Idempotency-Key
+    Api->>Db: BEGIN
+
+    rect rgb(238,244,252)
+        Note over Api,Db: R1 · สเตตเมนต์แรกเสมอ · ห้าม try/catch
+        Api->>Db: INSERT idempotency_key ON CONFLICT DO NOTHING
+        Db-->>Api: 1 row
+    end
+
+    rect rgb(252,240,238)
+        Note over Api,Db: ฐานข้อมูลตัดสิน ไม่ใช่โค้ด
+        Api->>Db: INSERT operation (LISTING_DELETE, actor_scope)
+        Note right of Db: trg_delist_admissible<br/>ก รายการมีอยู่ไหม (F5)<br/>ข เป็นของ actor_scope ไหม (F5)<br/>ค สถานะ ACTIVE ไหม<br/><br/>uq_listing_inflight<br/>ง มีงานค้างอยู่ไหม
+        Db-->>Api: ผ่าน
+    end
+
+    Api->>Db: INSERT operation_step 1 cancelListing
+    Api->>Db: INSERT operation_step 2 releaseFromVault
+    Api->>Db: INSERT outbox listing.delete.v1
+    Note right of Api: ไม่จองอะไรเพิ่ม<br/>คูปองถูกจองไว้แล้วตั้งแต่ FEAT-08
+    Api->>Db: COMMIT
+    Api-->>Shop: 202 operationId · stepCount 2
+
+    Note over Shop,Idx: ---- ขั้นที่ 1 · ปิดรายการบน chain ก่อน ----
+
+    Wrk->>Db: claim outbox FOR UPDATE SKIP LOCKED
+    Wrk->>Db: UPDATE step 1 SET raw_tx · COMMIT
+    Note right of Wrk: R2 · raw_tx commit ก่อน broadcast เสมอ
+    Wrk->>Ch: eth_sendRawTransaction cancelListing
+
+    alt chain รับ · ไม่มีใครซื้อตัดหน้า
+        Ch-->>Idx: event ListingCancelled
+        Idx->>Db: INSERT chain_event
+        Idx->>Db: UPDATE step 1 FINALIZED
+
+        Note over Shop,Idx: ---- ขั้นที่ 2 · คูปองออกจาก escrow ----
+        Note right of Db: trg_step_order_gate<br/>ขั้น 2 ยิงได้เมื่อขั้น 1 FINALIZED แล้ว
+        Wrk->>Db: UPDATE step 2 SET raw_tx · COMMIT
+        Wrk->>Ch: eth_sendRawTransaction releaseFromVault
+        Ch-->>Idx: event CouponReleased
+        Idx->>Db: UPDATE step 2 FINALIZED
+        Idx->>Db: UPDATE operation FINALIZED
+
+        rect rgb(238,248,240)
+            Note over Idx,Db: ลำดับนี้สลับไม่ได้
+            Idx->>Db: UPDATE listing_chain close_reason CANCELLED
+            Idx->>Db: UPDATE listing SET status DELISTED
+            Idx->>Db: UPDATE reservation SET released_at
+            Note right of Db: trg_coupon_hold_until_closed<br/>ปล่อยคูปองได้เมื่อรายการปิดแล้ว
+        end
+        Note right of Db: คูปองยัง HELD กับร้านเดิม<br/>ไม่เคยเปลี่ยน state เลย
+
+    else มีคนซื้อตัดหน้า · tx revert
+        Ch-->>Wrk: revert · listing ถูกซื้อไปแล้ว
+        Wrk->>Db: UPDATE operation CHAIN_REVERTED
+        Note right of Db: ไม่ใช่ error ของระบบ<br/>เป็นผลลัพธ์ปกติของการแข่ง
+        Idx->>Db: UPDATE listing_chain close_reason SOLD
+        Idx->>Db: UPDATE listing SET status SOLD
+        Note right of Db: คูปองยังอยู่ใน escrow<br/>การย้ายให้ผู้ซื้อเป็นงานของ FEAT-10
+    end

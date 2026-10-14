@@ -1,0 +1,42 @@
+  #   |                           ข้อรับประกัน                           |  ผล  
+------+---------------------------------------------------------------+------
+ T1   | webhook เดิมส่งซ้ำ → แถวที่สองได้ 0 rows                            | PASS
+ T2   | แก้ raw_body ของ webhook → ถูกปฏิเสธ                             | PASS
+ T3   | เขียน processed_at ได้ · ช่องอื่นแก้ไม่ได้                            | PASS
+ T4   | 100.50 บาท = 10050 สตางค์ = 100.5e18 base units                | PASS
+ T5   | ยอด base ผิดหลักสิบยกกำลัง → ถูกปฏิเสธ                              | PASS
+ T6   | provider_ref ซ้ำ → ชน uq_deposit_provider_ref                  | PASS
+ T7   | ยืนยันการฝากโดยไม่มี webhook → ถูกปฏิเสธ                            | PASS
+ T8   | F4 · mint จากการฝากที่ยังไม่จ่าย → ถูกปฏิเสธ                         | PASS
+ T9   | F4 · mint ยอดมากกว่าที่ฝาก → ถูกปฏิเสธ                             | PASS
+ T10  | mint ไปบัญชีคนอื่น → ถูกปฏิเสธ                                      | PASS
+ T11  | mint ถูกต้อง · ยอดเข้า 100 บาท · ISSUANCE ติดลบเท่ากัน              | PASS
+ T12  | mint การฝากที่ MINTED แล้ว → ถูกปฏิเสธด้วยสถานะ                     | PASS
+ T13  | MINTED กลับไป CONFIRMED → ถูกปฏิเสธ                              | PASS
+ T14  | PENDING_PAYMENT ข้ามไป MINTED → ถูกปฏิเสธ                        | PASS
+ T15  | ยืนยันแล้วแก้ยอด → ถูกปฏิเสธ                                        | PASS
+ T16  | F4 · LISTING_BUY แตะ ISSUANCE → ถูกปฏิเสธ                       | PASS
+ T17  | F4 · ลบ ISSUANCE = ผลรวมบัญชีอื่น                                 | PASS
+ T18  | mint ที่ไม่ลด ISSUANCE → ไม่ผ่าน                                   | PASS
+ T19  | mint = 1 step · mintTHB                                       | PASS
+ T20  | R2 · SUBMITTED โดยไม่มี raw_tx → ถูกปฏิเสธ                        | PASS
+ T21  | ตีกลับขณะยอดพอ → เผาคืนครบ · ยอดเหลือศูนย์                          | PASS
+ T22  | ยอดไม่พอแต่อ้างว่า BURNED → ถูกปฏิเสธ                               | PASS
+ T23  | ยอดไม่พอ → MANUAL_REVIEW · ยอดไม่ถูกแตะเลย                       | PASS
+ T24  | ยอดพอแต่อ้าง MANUAL_REVIEW → ถูกปฏิเสธ                            | PASS
+ T25  | ตีกลับการฝากที่ยังไม่ mint → ถูกปฏิเสธ                                | PASS
+ T26  | ตีกลับการฝากเดิมซ้ำ → ชน uq_reversal_deposit                      | PASS
+ T27  | สองงาน mint บนการฝากเดียว → ชน uq_mint_inflight                | PASS
+ T28  | ยอดลูกค้าติดลบ → ถูกปฏิเสธ                                         | PASS
+ T29  | ledger amount = 0 → ถูกปฏิเสธ                                   | PASS
+ T30  | outbox topic ไม่มี .vN → ถูกปฏิเสธ                                | PASS
+ T31  | อ่าน log ช่วงเดิมซ้ำ → chain_event ไม่เกิดแถวซ้ำ                     | PASS
+ T32  | webhook ที่ลายเซ็นไม่ผ่าน ไม่เข้าคิวงาน                               | PASS
+ T33  | ปิดท้าย · ledger รวม 0 · ยอดตรง · ISSUANCE มาจาก THB_MINT ทั้งหมด | PASS
+ T12b | สอง mint บนการฝากเดียวใน tx เดียว → ชน primary key              | PASS
+(34 rows)
+
+ ผ่าน | ไม่ผ่าน 
+-----+-------
+  34 |     0
+(1 row)

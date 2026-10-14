@@ -1,0 +1,418 @@
+openapi: 3.1.0
+info:
+  title: FEAT-05 · Transfer Point
+  version: 1.0.0-draft
+  summary: ร้านโอน point ให้ลูกค้า · ทีละคนหรือเป็นชุด
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 9 RFD 10 และ RFD 14
+
+    **ยอด point ไม่ได้เก็บเป็นตัวเลขเดียว**
+
+    point หมดอายุได้ และหมดอายุโดยไม่มี event บน chain (RFD 10)
+    ยอดจึงเก็บแยกเป็น bucket ตาม epoch ที่ได้รับมา แต่ละก้อนมี `expiresAt` ของตัวเอง
+
+    ```text
+    ยอดที่ใช้ได้ = ผลรวม bucket ที่ยังไม่หมดอายุ − reservation ที่ยังไม่ปล่อย
+    ```
+
+    คำนวณตอน query ทุกครั้ง ไม่มีคอลัมน์ไหนเก็บผลลัพธ์ไว้
+    เพราะถ้าเก็บ ค่าจะผิดทันทีที่เวลาเดินผ่านวันหมดอายุ
+
+    **การโอนเป็นชุด** — หนึ่งคำขอคือหนึ่ง `operation` แต่บน chain แบ่งเป็นหลาย tx
+    tx ละไม่เกิน 100 ผู้รับ · ผู้เรียกติดตามด้วย `operationId` เดียว ไม่ต้องเก็บหลายอัน
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Point
+    description: การโอนและยอดคงเหลือ
+  - name: Operation
+    description: ติดตามงาน async
+
+paths:
+  /v1/point-transfers:
+    post:
+      tags: [Point]
+      operationId: transferPoints
+      summary: โอน point ให้ลูกค้า
+      description: |
+        ผู้รับระบุได้ตั้งแต่ 1 ถึง 1000 คนในคำขอเดียว
+
+        **ยอดถูกจองทันทีที่ ADMIT** ไม่ต้องรอ chain
+        ถ้ายอดไม่พอจะได้ `422 INSUFFICIENT_POINTS` พร้อมยอดที่ใช้ได้จริง
+
+        **จองเกินไม่ได้แม้ส่งพร้อมกันหลายคำขอ** — ความถูกต้องมาจาก trigger
+        ที่ตรวจผลรวมใต้ advisory lock ไม่ใช่จากการ `SELECT` มาเช็คก่อน
+
+        **การปล่อยยอดที่จองไว้** เกิดเมื่องานจบเท่านั้น
+
+        | operation status | ยอดที่จองไว้ |
+        |---|---|
+        | `PENDING` `SUBMITTED` `CONFIRMED` | ยังถูกกันอยู่ |
+        | `FINALIZED` | ปล่อย · ยอดถูกหักจริงแล้ว |
+        | `CHAIN_REVERTED` | ปล่อย · ยอดกลับมาใช้ได้ |
+        | `MANUAL_REVIEW` | **ยังถูกกันอยู่** · ต้องให้คนตัดสินก่อน |
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+            examples:
+              คนเดียว:
+                value:
+                  pointTypeId: "pt_19bd"
+                  recipients:
+                    - customerId: "cus_8f2a"
+                      amount: "100000000000000000000"
+                  note: "โบนัสวันเกิด"
+              เป็นชุด:
+                value:
+                  pointTypeId: "pt_19bd"
+                  recipients:
+                    - customerId: "cus_8f2a"
+                      amount: "100000000000000000000"
+                    - customerId: "cus_77ac"
+                      amount: "50000000000000000000"
+      responses:
+        '202':
+          description: รับงานแล้ว · ยอดถูกจองไว้แล้ว
+          headers:
+            Location:
+              schema: { type: string }
+              example: /v1/operations/op_8f2a41
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferAccepted' }
+              examples:
+                เป็นชุด:
+                  value:
+                    operationId: "op_8f2a41"
+                    status: "PENDING"
+                    pointTypeId: "pt_19bd"
+                    recipientCount: 2
+                    totalAmount: "150000000000000000000"
+                    stepCount: 1
+                    reservedUntilFinal: true
+        '400':
+          description: |
+            header `Idempotency-Key` หาย หรือ body ผิดรูป
+
+            `amount` ต้องเป็น **string ของเลขจำนวนเต็ม** ไม่ใช่ JSON number (RFD 14)
+            ผู้รับซ้ำกันในคำขอเดียวไม่ได้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                amount เป็น number:
+                  value:
+                    error:
+                      code: "VALIDATION_FAILED"
+                      message: "amount ต้องเป็น string ของเลขจำนวนเต็ม"
+                      requestId: "req_01J9X"
+                      details:
+                        field: "recipients[0].amount"
+                ผู้รับซ้ำ:
+                  value:
+                    error:
+                      code: "DUPLICATE_RECIPIENT"
+                      message: "cus_8f2a ปรากฏมากกว่าหนึ่งครั้ง"
+                      requestId: "req_01J9Y"
+        '403':
+          description: point type นี้ไม่ใช่ของร้านผู้เรียก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Idempotency-Key ซ้ำแต่ body ต่าง หรือคำขอก่อนหน้ายังไม่จบ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            | code | หมายถึง |
+            |---|---|
+            | `INSUFFICIENT_POINTS` | ยอดที่ใช้ได้ไม่พอ |
+            | `POINT_TYPE_NOT_LIVE` | point type ยังไม่ `LIVE` หรือ `RETIRED` แล้ว |
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ยอดไม่พอ:
+                  value:
+                    error:
+                      code: "INSUFFICIENT_POINTS"
+                      message: "ยอดที่ใช้ได้ไม่พอ"
+                      requestId: "req_01J9Z"
+                      details:
+                        requested: "150000000000000000000"
+                        available: "80000000000000000000"
+
+  /v1/point-balances:
+    get:
+      tags: [Point]
+      operationId: getPointBalance
+      summary: ดูยอด point ของผู้ถือคนหนึ่ง
+      description: |
+        คืนทั้งยอดที่ใช้ได้ และรายละเอียด bucket แยกตามวันหมดอายุ
+        เพื่อให้หน้าเว็บแจ้งเตือนล่วงหน้าได้ว่า point ก้อนไหนใกล้หมดอายุ
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: pointTypeId
+          in: query
+          required: true
+          schema: { type: string }
+        - name: holderKind
+          in: query
+          required: true
+          schema: { type: string, enum: [MERCHANT, CUSTOMER] }
+        - name: holderId
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: ยอดคงเหลือ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceView' }
+              examples:
+                มีสองก้อน:
+                  value:
+                    pointTypeId: "pt_19bd"
+                    holderKind: "CUSTOMER"
+                    holderId: "cus_8f2a"
+                    decimals: 18
+                    available: "150000000000000000000"
+                    reserved: "0"
+                    buckets:
+                      - amount: "100000000000000000000"
+                        receivedAt: "2026-09-01T03:00:00Z"
+                        expiresAt: "2026-12-30T00:00:00Z"
+                      - amount: "50000000000000000000"
+                        receivedAt: "2026-10-01T09:00:00Z"
+                        expiresAt: "2027-01-29T00:00:00Z"
+        '404':
+          description: ไม่พบ point type หรือไม่ใช่ของร้านผู้เรียก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [Operation]
+      operationId: getOperation
+      summary: ดูสถานะงานโอน
+      description: |
+        งานที่แบ่งหลาย step จะเห็นทีละ step ว่าขั้นไหนจบแล้ว
+
+        **เฉพาะ `FINALIZED` เท่านั้นที่แปลว่าโอนสำเร็จ** (RFD 2 D9)
+        step บางอันสำเร็จแต่บางอันล้ม → `MANUAL_REVIEW` · ยอดที่จองไว้ยังถูกกัน
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: สถานะปัจจุบัน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+              examples:
+                สามขั้น ค้างขั้นสาม:
+                  value:
+                    operationId: "op_8f2a41"
+                    kind: "POINT_TRANSFER"
+                    status: "SUBMITTED"
+                    createdAt: "2026-10-01T09:12:44Z"
+                    finalizedAt: null
+                    steps:
+                      - index: 1
+                        name: "batchTransfer"
+                        recipientCount: 100
+                        status: "FINALIZED"
+                        txHash: "0xaa...01"
+                        nonce: 70
+                      - index: 2
+                        name: "batchTransfer"
+                        recipientCount: 100
+                        status: "FINALIZED"
+                        txHash: "0xbb...02"
+                        nonce: 71
+                      - index: 3
+                        name: "batchTransfer"
+                        recipientCount: 43
+                        status: "SUBMITTED"
+                        txHash: "0xcc...03"
+                        nonce: 72
+        '404':
+          description: ไม่พบงาน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID v4 ที่ client สร้างเอง · ส่งค่าเดิมเมื่อ retry · เก็บไว้ 72 ชั่วโมง
+      schema: { type: string, minLength: 8, maxLength: 255 }
+      example: "11111111-2222-3333-4444-555555555555"
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: |
+        จำนวนเต็มในหน่วยเล็กสุด ส่งเป็น **string** เสมอ
+        JSON number แม่นยำถึงแค่ 2^53 ส่วน uint256 ไปถึง ~1.15e77 (RFD 14)
+      examples: ["100000000000000000000"]
+
+    Recipient:
+      type: object
+      additionalProperties: false
+      required: [customerId, amount]
+      properties:
+        customerId: { type: string, examples: ["cus_8f2a"] }
+        amount:     { $ref: '#/components/schemas/BaseUnits' }
+
+    TransferRequest:
+      type: object
+      additionalProperties: false
+      required: [pointTypeId, recipients]
+      properties:
+        pointTypeId: { type: string }
+        recipients:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          description: ลูกค้าคนเดียวกันซ้ำในคำขอเดียวไม่ได้
+          items: { $ref: '#/components/schemas/Recipient' }
+        note:
+          type: [string, 'null']
+          maxLength: 200
+          description: ข้อความที่ลูกค้าเห็น · ไม่ขึ้น chain
+
+    TransferAccepted:
+      type: object
+      required: [operationId, status, pointTypeId, recipientCount, totalAmount, stepCount]
+      properties:
+        operationId:    { type: string }
+        status:         { const: "PENDING" }
+        pointTypeId:    { type: string }
+        recipientCount: { type: integer, minimum: 1 }
+        totalAmount:    { $ref: '#/components/schemas/BaseUnits' }
+        stepCount:
+          type: integer
+          minimum: 1
+          description: จำนวน tx บน chain · ceil(recipientCount / 100)
+        reservedUntilFinal:
+          type: boolean
+          description: true เสมอ · ยอดถูกกันไว้จนกว่างานจะจบ
+
+    Bucket:
+      type: object
+      required: [amount, receivedAt, expiresAt]
+      properties:
+        amount:     { $ref: '#/components/schemas/BaseUnits' }
+        receivedAt: { type: string, format: date-time }
+        expiresAt:
+          type: string
+          format: date-time
+          description: คำนวณจาก genesis_at และ epoch_seconds ของ contract (RFD 10)
+
+    BalanceView:
+      type: object
+      required: [pointTypeId, holderKind, holderId, decimals, available, reserved, buckets]
+      properties:
+        pointTypeId: { type: string }
+        holderKind:  { type: string, enum: [MERCHANT, CUSTOMER] }
+        holderId:    { type: string }
+        decimals:    { type: integer, description: ใช้แปลงที่ชั้นแสดงผลเท่านั้น }
+        available:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: ผลรวม bucket ที่ยังไม่หมดอายุ ลบด้วยยอดที่จองไว้
+        reserved:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: ยอดที่ถูกกันไว้ระหว่างรอ chain
+        buckets:
+          type: array
+          description: เรียงตามวันหมดอายุ ใกล้ที่สุดก่อน
+          items: { $ref: '#/components/schemas/Bucket' }
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    OperationStep:
+      type: object
+      required: [index, name, status]
+      properties:
+        index:          { type: integer, minimum: 1 }
+        name:           { const: "batchTransfer" }
+        recipientCount: { type: integer, minimum: 1, maximum: 100 }
+        status:         { $ref: '#/components/schemas/StepStatus' }
+        txHash:         { type: [string, 'null'] }
+        nonce:          { type: [integer, 'null'], minimum: 0 }
+
+    Operation:
+      type: object
+      required: [operationId, kind, status, createdAt, steps]
+      properties:
+        operationId: { type: string }
+        kind:        { const: "POINT_TRANSFER" }
+        status:      { $ref: '#/components/schemas/OperationStatus' }
+        createdAt:   { type: string, format: date-time }
+        finalizedAt: { type: [string, 'null'], format: date-time }
+        errorNote:   { type: [string, 'null'] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - IDEMPOTENCY_KEY_REQUIRED
+                - IDEMPOTENCY_KEY_REUSED
+                - IDEMPOTENCY_KEY_IN_PROGRESS
+                - VALIDATION_FAILED
+                - DUPLICATE_RECIPIENT
+                - INSUFFICIENT_POINTS
+                - POINT_TYPE_NOT_LIVE
+                - POINT_TYPE_NOT_FOUND
+                - FORBIDDEN
+                - RATE_LIMITED
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

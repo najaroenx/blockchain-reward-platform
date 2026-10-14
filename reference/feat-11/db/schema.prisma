@@ -1,0 +1,336 @@
+// =====================================================================
+// FEAT-11 · Redeem Coupon · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อตารางใน DB เป็น snake_case
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum OperationKind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+
+  @@map("operation_kind")
+}
+
+enum OperationStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+
+  @@map("operation_status")
+}
+
+enum StepStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+
+  @@map("step_status")
+}
+
+enum CouponCodeState {
+  ISSUED
+  HELD
+  REDEEMED
+  EXPIRED
+  VOIDED
+
+  @@map("coupon_code_state")
+}
+
+enum ReservationSubject {
+  POINT_BALANCE
+  COUPON_UNIT
+  LISTING
+  THB_BALANCE
+  ESCROW
+
+  @@map("reservation_subject")
+}
+
+enum ActorType {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+
+  @@map("actor_type")
+}
+
+// ------------------------------------------------------ Group A · ตัวตน
+model Merchant {
+  id        String   @id
+  name      String
+  status    String   @default("PENDING")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  couponTypes CouponType[]
+
+  @@map("merchant")
+}
+
+model Customer {
+  id        String   @id
+  telHash   Bytes    @map("tel_hash")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([telHash], map: "uq_customer_tel")
+  @@map("customer")
+}
+
+/// RFD 4 · L6 — ไม่มีคอลัมน์ private key ไม่มีวันมี
+/// keyRef ชี้ไป KMS เท่านั้น
+model Wallet {
+  id        String   @id
+  address   Bytes
+  keyRef    String   @map("key_ref")
+  ownerKind String   @map("owner_kind")
+  ownerId   String   @map("owner_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  escrowsAsSeller Escrow[] @relation("EscrowSeller")
+  escrowsAsBuyer  Escrow[] @relation("EscrowBuyer")
+
+  @@unique([address], map: "uq_wallet_address")
+  @@unique([ownerKind, ownerId], map: "uq_wallet_owner")
+  @@map("wallet")
+}
+
+model CouponType {
+  id              String    @id
+  merchantId      String    @map("merchant_id")
+  name            String
+  contractAddress Bytes     @map("contract_address")
+  chainTypeId     Decimal   @map("chain_type_id") @db.Decimal(78, 0)
+  /// RFD 14 · base units · อ่านเป็น string เสมอตอนส่งออก
+  faceValue       Decimal   @map("face_value") @db.Decimal(78, 0)
+  expiresAt       DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  merchant Merchant     @relation(fields: [merchantId], references: [id])
+  codes    CouponCode[]
+  holdings CouponHolding[]
+
+  @@unique([contractAddress, chainTypeId], map: "uq_coupon_type_chain")
+  @@map("coupon_type")
+}
+
+/// RFD 11 §3.3 — plaintext ของ code ไม่เคยอยู่ในตารางนี้
+/// codeHash ใช้ค้นหา · codeRef คือสิ่งที่ส่งขึ้น chain (hash ของ id ไม่ใช่ของ plaintext)
+model CouponCode {
+  id           String          @id
+  couponTypeId String          @map("coupon_type_id")
+  codeHash     Bytes           @map("code_hash")
+  codeRef      Bytes           @map("code_ref")
+  state        CouponCodeState @default(ISSUED)
+  holderKind   String?         @map("holder_kind")
+  holderId     String?         @map("holder_id")
+  issuedAt     DateTime        @default(now()) @map("issued_at") @db.Timestamptz(6)
+  redeemedAt   DateTime?       @map("redeemed_at") @db.Timestamptz(6)
+
+  couponType CouponType @relation(fields: [couponTypeId], references: [id])
+
+  @@unique([codeHash], map: "uq_coupon_code_hash")
+  @@unique([codeRef], map: "uq_coupon_code_ref")
+  @@index([holderKind, holderId], map: "ix_coupon_code_holder")
+  @@map("coupon_code")
+}
+
+// --------------------------------------------- Group B · แกน write path
+/// RFD 3 · D1 — unique คือ (scope, key) ไม่ใช่ (actorId, key)
+/// ตอนสมัครยังไม่มี actor จึงใช้ anon:<sha256(email)> เป็น scope
+model IdempotencyKey {
+  id             String    @id
+  scope          String
+  key            String
+  fingerprint    Bytes
+  operationId    String?   @map("operation_id")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@index([expiresAt], map: "ix_idem_expiry")
+  @@map("idempotency_key")
+}
+
+/// id ของแถวนี้คือ operationId ที่คืนใน 202
+model Operation {
+  id          String          @id
+  actorScope  String          @map("actor_scope")
+  kind        OperationKind
+  status      OperationStatus @default(PENDING)
+  payload     Json
+  errorNote   String?         @map("error_note")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  finalizedAt DateTime?       @map("finalized_at") @db.Timestamptz(6)
+
+  steps           OperationStep[]
+  outbox          Outbox[]
+  reservations    Reservation[]
+  events          OperationEvent[]
+  idempotencyKeys IdempotencyKey[]
+  chainEvents     ChainEvent[]
+
+  @@map("operation")
+}
+
+/// RFD 2 · D4 — หนึ่งแถวต่อหนึ่ง chain tx
+/// RFD 2 · R2 — rawTx ต้อง COMMIT ก่อน broadcast เสมอ (บังคับด้วย CHECK ใน migration.sql)
+model OperationStep {
+  id            String     @id
+  operationId   String     @map("operation_id")
+  stepIndex     Int        @map("step_index")
+  name          String
+  signerAddress Bytes?     @map("signer_address")
+  nonce         BigInt?
+  rawTx         Bytes?     @map("raw_tx")
+  txHash        Bytes?     @map("tx_hash")
+  status        StepStatus @default(PENDING)
+  submittedAt   DateTime?  @map("submitted_at") @db.Timestamptz(6)
+  confirmedAt   DateTime?  @map("confirmed_at") @db.Timestamptz(6)
+  finalizedAt   DateTime?  @map("finalized_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@unique([operationId, stepIndex], map: "uq_step_order")
+  @@unique([txHash], map: "uq_step_txhash")
+  @@unique([signerAddress, nonce], map: "uq_signer_nonce")
+  @@map("operation_step")
+}
+
+/// RFD 2 · D1 — INSERT แถวนี้อยู่ใน transaction เดียวกับ INSERT operation เสมอ
+/// sentAt = null คือยังไม่มีใครหยิบ
+model Outbox {
+  id          String    @id
+  operationId String    @map("operation_id")
+  topic       String
+  payload     Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_outbox_pending")
+  @@map("outbox")
+}
+
+/// RFD 11 · D4 — partial unique index ใน migration.sql ทำให้จองซ้อนเป็นไปไม่ได้
+/// Prisma ยังประกาศ partial index ไม่ได้ จึงอยู่ใน migration.sql เท่านั้น
+model Reservation {
+  id          String             @id
+  operationId String             @map("operation_id")
+  subjectType ReservationSubject @map("subject_type")
+  subjectId   String             @map("subject_id")
+  amount      Decimal            @db.Decimal(78, 0)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  releasedAt  DateTime?          @map("released_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([subjectType, subjectId], map: "ix_reservation_subject")
+  @@map("reservation")
+}
+
+model OperationEvent {
+  id          String           @id
+  operationId String           @map("operation_id")
+  fromStatus  OperationStatus? @map("from_status")
+  toStatus    OperationStatus  @map("to_status")
+  actor       ActorType        @default(SYSTEM)
+  txHash      Bytes?           @map("tx_hash")
+  metadata    Json             @default("{}")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([operationId, createdAt], map: "ix_opevent_operation")
+  @@map("operation_event")
+}
+
+// -------------------------------------------- Group C · ฝั่งอ่าน chain
+/// RFD 5 · D2 — unique (txHash, logIndex) ทำให้ re-index ช่วงเดิมปลอดภัย
+model ChainEvent {
+  id             String    @id
+  blockNumber    BigInt    @map("block_number")
+  blockHash      Bytes     @map("block_hash")
+  txHash         Bytes     @map("tx_hash")
+  logIndex       Int       @map("log_index")
+  address        Bytes
+  topic0         Bytes
+  topics         Json      @default("[]")
+  data           Bytes
+  blockTimestamp DateTime  @map("block_timestamp") @db.Timestamptz(6)
+  operationId    String?   @map("operation_id")
+  orphanedAt     DateTime? @map("orphaned_at") @db.Timestamptz(6)
+  appliedAt      DateTime? @map("applied_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([txHash, logIndex], map: "uq_chain_event")
+  @@index([blockNumber], map: "ix_chain_event_unapplied")
+  @@map("chain_event")
+}
+
+// ------------------------------------------------ Group D · projection
+/// ลบทิ้งทั้งตารางแล้ว replay chain_event ใหม่ ต้องได้ค่าเดิมเป๊ะ (RFD 6)
+model CouponHolding {
+  id           String   @id
+  couponTypeId String   @map("coupon_type_id")
+  holderKind   String   @map("holder_kind")
+  holderId     String   @map("holder_id")
+  quantity     Decimal  @db.Decimal(78, 0)
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  couponType CouponType @relation(fields: [couponTypeId], references: [id])
+
+  @@unique([couponTypeId, holderKind, holderId], map: "uq_holding")
+  @@map("coupon_holding")
+}
+
+/// RFD 13 · ยืนยันจาก Vault.json จริง — escrow ผูกกับ tokenId เดียว active ได้ทีละก้อน
+model Escrow {
+  id              String   @id
+  chainTokenId    Decimal  @map("chain_token_id") @db.Decimal(78, 0)
+  contractAddress Bytes    @map("contract_address")
+  sellerWalletId  String   @map("seller_wallet_id")
+  buyerWalletId   String   @map("buyer_wallet_id")
+  totalAmount     Decimal  @map("total_amount") @db.Decimal(78, 0)
+  remainingAmount Decimal  @map("remaining_amount") @db.Decimal(78, 0)
+  couponsLocked   Int      @map("coupons_locked")
+  couponsRedeemed Int      @default(0) @map("coupons_redeemed")
+  active          Boolean  @default(true)
+  lockedAt        DateTime @default(now()) @map("locked_at") @db.Timestamptz(6)
+
+  seller Wallet @relation("EscrowSeller", fields: [sellerWalletId], references: [id])
+  buyer  Wallet @relation("EscrowBuyer", fields: [buyerWalletId], references: [id])
+
+  @@index([contractAddress, chainTokenId], map: "ix_escrow_token")
+  @@map("escrow")
+}

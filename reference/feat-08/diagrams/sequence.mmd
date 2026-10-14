@@ -1,0 +1,77 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant A as api
+    participant D as PostgreSQL
+    participant W as worker
+    participant N as chain
+    participant I as indexer
+    participant P as projector
+
+    rect rgb(248,249,250)
+    Note over C,D: ADMIT · api · transaction เดียว
+    C->>+A: POST /v1/listings · { couponTypeId, unitPrice, couponCodeIds[5] }
+    A->>A: ใบซ้ำในคำขอไหม · unitPrice เป็น string และมากกว่า 0 ไหม
+    A->>A: totalPrice = unitPrice × 5 ผ่าน bigint
+    A->>+D: BEGIN
+    A->>D: INSERT idempotency_key ON CONFLICT DO NOTHING
+    A->>D: INSERT listing · status PENDING · quantity 5
+    loop ทีละใบ
+        A->>D: INSERT listing_item
+        Note right of D: trigger ตรวจ 4 ข้อ<br/>HELD · อยู่ในมือผู้ขาย<br/>ประเภทตรงกัน · ยังไม่หมดอายุ
+    end
+    A->>D: INSERT operation LISTING_CREATE · PENDING
+    A->>D: INSERT operation_step ×3 · approve, createListing, lock
+    A->>D: INSERT reservation COUPON_UNIT ×5 + LISTING ×1
+    Note right of D: uq_reservation_exclusive<br/>ใบที่ลงขายอยู่แล้ว → 409 ทันที
+    A->>D: INSERT outbox · listing.create.v1
+    A->>D: UPDATE idempotency_key SET response 202
+    D-->>-A: COMMIT
+    A-->>-C: 202 { listingId, stepCount 3 }
+    end
+
+    Note over W,N: SUBMIT · สาม tx ที่ต้องเรียงกัน
+    W->>+D: claim outbox FOR UPDATE SKIP LOCKED
+    D-->>-W: operation + step ที่ยัง PENDING
+    W->>D: SELECT next_nonce FROM signer FOR UPDATE
+    W->>W: build raw_tx · approveCoupon
+    W->>D: UPDATE step 1 SET raw_tx nonce · COMMIT ก่อน broadcast
+    W->>+N: eth_sendRawTransaction
+    N-->>-W: tx_hash
+    W->>D: UPDATE step 1 → SUBMITTED
+
+    Note over I,N: indexer เห็น log แล้ว projector เลื่อน step
+    I->>+N: eth_getLogs fromBlock = cursor
+    N-->>-I: Approval
+    I->>D: INSERT chain_event ON CONFLICT DO NOTHING
+    P->>D: step 1 → FINALIZED เมื่อผ่าน N block
+
+    Note over W,N: step 2 เริ่มได้ก็ต่อเมื่อ step 1 จบ
+    W->>+N: createListing(couponTypeId, codeRef[], unitPrice)
+    N-->>-W: tx_hash
+    P->>D: step 2 → FINALIZED
+    P->>D: INSERT listing_chain · chain_listing_id
+
+    Note over W,N: step 3 ย้ายคูปองเข้า escrow
+    W->>+N: lockInVault(chainListingId)
+    N-->>-W: tx_hash
+    alt ทั้งสาม step FINALIZED
+        P->>D: listing → ACTIVE · active_at
+        P->>D: operation → FINALIZED
+        Note right of D: ยังไม่ปล่อย reservation<br/>คูปองต้องถูกกันไว้จนกว่าจะขายหรือถอด
+    else step ใด step หนึ่งล้ม
+        P->>D: operation → MANUAL_REVIEW
+        Note right of D: คูปองยังถูกกันอยู่<br/>ต้องให้คนตัดสินก่อน
+    end
+
+    C->>+A: GET /v1/listings?couponTypeId
+    A->>D: SELECT listing WHERE status ACTIVE ORDER BY unit_price
+    A-->>-C: รายการที่ขายอยู่ เรียงจากถูกไปแพง

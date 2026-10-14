@@ -1,0 +1,336 @@
+openapi: 3.1.0
+info:
+  title: FEAT-11 · Redeem Coupon
+  version: 1.0.0-draft
+  summary: ใช้คูปองหนึ่งใบ · burn บน chain แล้วปล่อยเงินจาก escrow ให้ผู้ขาย
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 11 และ RFD 13
+
+    **สองเรื่องที่ต้องรู้ก่อนเรียก**
+
+    1. endpoint นี้เป็น async — ตอบ `202` พร้อม `operationId` ไม่ได้แปลว่า burn เสร็จแล้ว
+       ต้อง poll `GET /v1/operations/{operationId}` จนได้ `status = FINALIZED`
+       หรือรอ webhook `operation.finalized` (RFD 15)
+    2. จำนวนเงินทุกตัวเป็น **string ของ base units** ไม่ใช่ JSON number (RFD 14)
+       `"100000000000000000000"` คือ 100.000000 เมื่อ `decimals = 18`
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Coupon
+    description: วงจรชีวิตของคูปอง
+  - name: Operation
+    description: ติดตามงาน async
+
+paths:
+  /v1/coupons/redeem:
+    post:
+      tags: [Coupon]
+      operationId: redeemCoupon
+      summary: ใช้คูปองหนึ่งใบ
+      description: |
+        ผู้เรียกคือเจ้าของคูปอง (`customer`) หรือร้านค้าที่สแกนให้ (`merchant_admin`)
+        สิทธิ์ถูกบังคับด้วย `WHERE holder_id = $1` ใน query ไม่ใช่ `if` ในโค้ด (RFD 16 D4)
+
+        งานนี้มี **2 step บน chain**
+
+        | step | ชื่อ | contract |
+        |---|---|---|
+        | 1 | `burnCoupon` | `Coupon` |
+        | 2 | `releaseFundsPartial` | `Vault` |
+
+        step 1 ต้องสำเร็จก่อน step 2 เสมอ · ถ้า step 2 ล้มระบบจะเข้า `MANUAL_REVIEW`
+        ไม่ย้อน step 1 เพราะ chain ย้อนไม่ได้ (RFD 13 §3.6)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemRequest'
+            examples:
+              ปกติ:
+                summary: ลูกค้าใช้คูปองของตัวเอง
+                value:
+                  couponCode: "7KQ4-M2XB-91TN"
+                  redeemedAtMerchantId: "mch_8f2a"
+      responses:
+        '202':
+          description: รับงานแล้ว · ยังไม่เสร็จ
+          headers:
+            Location:
+              description: ที่อยู่สำหรับติดตามงาน
+              schema: { type: string }
+              example: /v1/operations/op_8f2a41
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RedeemAccepted'
+              examples:
+                ปกติ:
+                  value:
+                    operationId: "op_8f2a41"
+                    status: "PENDING"
+                    couponCodeId: "cc_19bd"
+                    settlement:
+                      amount: "50000000000000000000"
+                      currency: "THB"
+                      decimals: 18
+        '400':
+          description: header `Idempotency-Key` หาย หรือ body ผิดรูป · ระบบไม่สร้าง key ให้เอง
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ไม่มี Idempotency-Key:
+                  value:
+                    error:
+                      code: "IDEMPOTENCY_KEY_REQUIRED"
+                      message: "ต้องส่ง header Idempotency-Key"
+                      requestId: "req_01J9X"
+        '403':
+          description: ผู้เรียกไม่ใช่ผู้ถือคูปองใบนี้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: ไม่พบคูปอง · ตอบเหมือนกันกับกรณีไม่ใช่เจ้าของเพื่อไม่ให้เดารหัสได้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            ชนกับงานอื่น · ดู `code` เพื่อแยกว่า retry ได้หรือไม่
+
+            | code | retry ได้ไหม |
+            |---|---|
+            | `IDEMPOTENCY_KEY_IN_PROGRESS` | ได้ · รอตาม `Retry-After` |
+            | `IDEMPOTENCY_KEY_REUSED` | ไม่ได้ · key เดิมแต่ body ต่าง |
+            | `COUPON_ALREADY_REDEEMED` | ไม่ได้ |
+            | `COUPON_LOCKED` | ได้ · มีงานอื่นจองใบนี้อยู่ |
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              example: 1
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ใช้ไปแล้ว:
+                  value:
+                    error:
+                      code: "COUPON_ALREADY_REDEEMED"
+                      message: "คูปองใบนี้ถูกใช้ไปแล้วเมื่อ 2026-09-28T10:14:02Z"
+                      requestId: "req_01J9X"
+                กำลังทำอยู่:
+                  value:
+                    error:
+                      code: "COUPON_LOCKED"
+                      message: "มีคำขออื่นกำลังใช้คูปองใบนี้อยู่"
+                      requestId: "req_01J9Y"
+        '422':
+          description: คูปองหมดอายุ หรือ escrow ไม่มีเงินพอจ่าย
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: เกิน rate limit
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [Operation]
+      operationId: getOperation
+      summary: ดูสถานะงาน
+      description: |
+        **เฉพาะ `FINALIZED` เท่านั้นที่แสดงต่อผู้ใช้ได้ว่า "สำเร็จ"**
+        `CONFIRMED` ยังย้อนได้ถ้าเกิด reorg (RFD 2 D9)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: สถานะปัจจุบัน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+              examples:
+                ค้างที่ step 2:
+                  value:
+                    operationId: "op_8f2a41"
+                    kind: "COUPON_REDEEM"
+                    status: "SUBMITTED"
+                    createdAt: "2026-10-01T03:12:44Z"
+                    finalizedAt: null
+                    steps:
+                      - index: 1
+                        name: "burnCoupon"
+                        status: "FINALIZED"
+                        txHash: "0xaa...01"
+                        nonce: 41
+                      - index: 2
+                        name: "releaseFundsPartial"
+                        status: "SUBMITTED"
+                        txHash: "0xbb...02"
+                        nonce: 42
+                เสร็จแล้ว:
+                  value:
+                    operationId: "op_8f2a41"
+                    kind: "COUPON_REDEEM"
+                    status: "FINALIZED"
+                    createdAt: "2026-10-01T03:12:44Z"
+                    finalizedAt: "2026-10-01T03:13:58Z"
+                    steps:
+                      - index: 1
+                        name: "burnCoupon"
+                        status: "FINALIZED"
+                        txHash: "0xaa...01"
+                        nonce: 41
+                      - index: 2
+                        name: "releaseFundsPartial"
+                        status: "FINALIZED"
+                        txHash: "0xbb...02"
+                        nonce: 42
+        '404':
+          description: ไม่พบงาน หรือไม่ใช่งานของผู้เรียก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        UUID v4 ที่ client สร้างเอง · ส่งค่าเดิมเมื่อ retry เพื่อไม่ให้เกิดงานซ้ำ
+        **server ไม่สร้างให้เอง** ถ้าไม่ส่งจะได้ `400` (RFD 3 D6)
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 255
+      example: "11111111-2222-3333-4444-555555555555"
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: |
+        จำนวนเต็มในหน่วยเล็กสุด ส่งเป็น **string** เสมอ
+        JSON number แม่นยำถึงแค่ 2^53 ส่วน uint256 ไปถึง ~1.15e77 (RFD 14)
+      examples: ["100000000000000000000"]
+
+    RedeemRequest:
+      type: object
+      additionalProperties: false
+      required: [couponCode]
+      properties:
+        couponCode:
+          type: string
+          pattern: '^[0-9A-HJ-NP-TV-Z]{4}-[0-9A-HJ-NP-TV-Z]{4}-[0-9A-HJ-NP-TV-Z]{4}$'
+          description: Crockford base32 · ไม่มี I L O U เพื่อไม่ให้อ่านสับสน
+          examples: ["7KQ4-M2XB-91TN"]
+        redeemedAtMerchantId:
+          type: [string, 'null']
+          description: ร้านที่รับคูปอง · ว่างได้ถ้าใช้ผ่านช่องทางออนไลน์
+          examples: ["mch_8f2a"]
+
+    RedeemAccepted:
+      type: object
+      required: [operationId, status, couponCodeId]
+      properties:
+        operationId: { type: string, examples: ["op_8f2a41"] }
+        status:
+          type: string
+          const: PENDING
+          description: สถานะตอนรับงานเป็น PENDING เสมอ
+        couponCodeId: { type: string, examples: ["cc_19bd"] }
+        settlement:
+          type: object
+          description: เงินที่จะถูกปล่อยให้ผู้ขายเมื่องานสำเร็จ
+          required: [amount, currency, decimals]
+          properties:
+            amount:   { $ref: '#/components/schemas/BaseUnits' }
+            currency: { type: string, examples: ["THB"] }
+            decimals: { type: integer, minimum: 0, maximum: 30, examples: [18] }
+
+    OperationStep:
+      type: object
+      required: [index, name, status]
+      properties:
+        index:  { type: integer, minimum: 1 }
+        name:   { type: string, examples: ["burnCoupon", "releaseFundsPartial"] }
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash: { type: [string, 'null'], pattern: '^0x[0-9a-f]{64}$|^0x[0-9a-f.]{6,}$' }
+        nonce:  { type: [integer, 'null'], minimum: 0 }
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+      description: |
+        | status | แสดงต่อผู้ใช้ว่า | ทำอะไรต่อ |
+        |---|---|---|
+        | `PENDING` | กำลังดำเนินการ | รอ |
+        | `SUBMITTED` | กำลังดำเนินการ | รอ |
+        | `CONFIRMED` | กำลังดำเนินการ | รอ · **ยังย้อนได้** |
+        | `FINALIZED` | สำเร็จ | จบ |
+        | `CHAIN_REVERTED` | ไม่สำเร็จ | ลองใหม่ได้ |
+        | `ORPHANED` | กำลังดำเนินการ | ระบบส่งใหม่ให้เอง |
+        | `MANUAL_REVIEW` | ติดปัญหา | ต้องมีคนดู |
+
+    Operation:
+      type: object
+      required: [operationId, kind, status, createdAt, steps]
+      properties:
+        operationId: { type: string }
+        kind:
+          type: string
+          enum: [MERCHANT_PROVISION, POINT_TYPE_CREATE, POINT_TRANSFER,
+                 COUPON_TYPE_CREATE, COUPON_ISSUE, COUPON_REDEEM,
+                 LISTING_CREATE, LISTING_DELETE, LISTING_BUY, THB_MINT]
+        status:      { $ref: '#/components/schemas/OperationStatus' }
+        createdAt:   { type: string, format: date-time }
+        finalizedAt: { type: [string, 'null'], format: date-time }
+        errorNote:   { type: [string, 'null'] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:      { type: string, examples: ["COUPON_ALREADY_REDEEMED"] }
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

@@ -1,0 +1,406 @@
+openapi: 3.1.0
+info:
+  title: FEAT-04 · Create Point Type
+  version: 1.0.0-draft
+  summary: ร้านประกาศ point ของตัวเอง แล้วระบบ deploy token ผ่าน factory บน chain
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 9 RFD 10 และ RFD 6
+
+    **การตัดสินใจหลักของ feature นี้ · แยกสองตาราง**
+
+    | ตาราง | ค่ามาจากไหน | เขียนโดย | ลบทิ้งแล้ว replay ได้ไหม |
+    |---|---|---|---|
+    | `point_type` | ร้านเป็นคนพิมพ์ | api ตอน ADMIT | **ไม่ได้** · ชื่อไม่ได้อยู่บน chain |
+    | `point_type_chain` | chain | projector | ได้เสมอ |
+
+    ถ้ารวมเป็นตารางเดียว ตารางนั้นจะ rebuild ไม่ได้ ซึ่งผิดกฎของ Group D (RFD 6 §3.2)
+    แยกแล้วแต่ละตารางมีเจ้าของคนเดียวและกฎการกู้คืนที่ชัดเจน
+
+    **คืน `202` เพราะงานนี้ต้องจบบน chain จริงๆ**
+
+    ต่างจาก FEAT-01 ที่คืน `201` ได้เพราะร้านมีตัวตนโดยไม่ต้องรอ chain
+    point type ที่ยังไม่มี contract คือ point type ที่ใช้ไม่ได้ จึงไม่มีอะไรจะส่งคืนก่อน
+    `status` เริ่มที่ `REQUESTED` และเป็น `LIVE` เมื่อ deploy `FINALIZED`
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Point
+    description: ประเภทของ point และการออก
+  - name: Operation
+    description: ติดตามงาน async
+
+paths:
+  /v1/point-types:
+    post:
+      tags: [Point]
+      operationId: createPointType
+      summary: ประกาศ point type ใหม่
+      description: |
+        **ร้านต้องเป็น `ACTIVE` ก่อน** · ร้านที่ยังอยู่ `PENDING` จาก FEAT-01
+        จะได้ `422 MERCHANT_WALLET_NOT_READY` — ข้อนี้บังคับด้วย trigger ในฐานข้อมูล
+        ไม่ใช่แค่ guard ในโค้ด
+
+        **ชื่อและสัญลักษณ์ถูกจองทันทีที่ ADMIT** ไม่ต้องรอ chain
+        ถ้า deploy ล้ม `status` กลายเป็น `FAILED` แล้วชื่อถูกปล่อยคืนให้ใช้ใหม่ได้
+        (partial unique index ครอบเฉพาะแถวที่ไม่ใช่ `FAILED`)
+
+        **1 step บน chain** — `factory.createPointToken(name, symbol, decimals)`
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePointTypeRequest' }
+            examples:
+              ปกติ:
+                value:
+                  name: "แต้มสะสมสุขใจ"
+                  symbol: "SUKJAI"
+                  decimals: 18
+      responses:
+        '202':
+          description: รับงานแล้ว · point type ยังใช้ไม่ได้จนกว่าจะ LIVE
+          headers:
+            Location:
+              schema: { type: string }
+              example: /v1/operations/op_8f2a41
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatePointTypeAccepted' }
+              examples:
+                ปกติ:
+                  value:
+                    pointTypeId: "pt_19bd"
+                    name: "แต้มสะสมสุขใจ"
+                    symbol: "SUKJAI"
+                    decimals: 18
+                    status: "REQUESTED"
+                    operationId: "op_8f2a41"
+        '400':
+          description: |
+            header `Idempotency-Key` หาย หรือ body ผิดรูป
+
+            `symbol` ต้องเป็นตัวใหญ่ล้วน 2–11 ตัว ขึ้นต้นด้วยตัวอักษร
+            `decimals` ต้องอยู่ในช่วง 0–30
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                symbol ผิดรูป:
+                  value:
+                    error:
+                      code: "VALIDATION_FAILED"
+                      message: "symbol ต้องเป็นตัวพิมพ์ใหญ่ 2-11 ตัว"
+                      requestId: "req_01J9X"
+                      details:
+                        field: "symbol"
+        '403':
+          description: ไม่ใช่ร้านของผู้เรียก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            | code | หมายถึง | retry ได้ไหม |
+            |---|---|---|
+            | `SYMBOL_TAKEN` | ร้านนี้ใช้ symbol นี้ไปแล้ว | ไม่ได้ |
+            | `NAME_TAKEN` | ร้านนี้ใช้ชื่อนี้ไปแล้ว | ไม่ได้ |
+            | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body ต่าง | ไม่ได้ |
+            | `IDEMPOTENCY_KEY_IN_PROGRESS` | คำขอก่อนหน้ายังไม่จบ | ได้ |
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                symbol ซ้ำ:
+                  value:
+                    error:
+                      code: "SYMBOL_TAKEN"
+                      message: "ร้านของคุณใช้ symbol SUKJAI ไปแล้ว"
+                      requestId: "req_01J9Y"
+        '422':
+          description: ร้านยังไม่พร้อม · provision wallet จาก FEAT-01 ยังไม่เสร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ร้านยังไม่ ACTIVE:
+                  value:
+                    error:
+                      code: "MERCHANT_WALLET_NOT_READY"
+                      message: "ร้านยังเตรียม wallet ไม่เสร็จ"
+                      requestId: "req_01J9Z"
+
+    get:
+      tags: [Point]
+      operationId: listPointTypes
+      summary: ดู point type ทั้งหมดของร้าน
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/PointTypeStatus' }
+      responses:
+        '200':
+          description: รายการ point type
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pointTypes]
+                properties:
+                  pointTypes:
+                    type: array
+                    items: { $ref: '#/components/schemas/PointType' }
+              examples:
+                หนึ่งอันพร้อม หนึ่งอันรอ:
+                  value:
+                    pointTypes:
+                      - pointTypeId: "pt_19bd"
+                        name: "แต้มสะสมสุขใจ"
+                        symbol: "SUKJAI"
+                        decimals: 18
+                        status: "LIVE"
+                        chain:
+                          contractAddress: "0xaaaa...aaaa"
+                          genesisAt: "2026-10-01T00:00:00Z"
+                          epochSeconds: 2592000
+                          validityEpochs: 4
+                      - pointTypeId: "pt_77ac"
+                        name: "แต้มพิเศษ"
+                        symbol: "SPECIAL"
+                        decimals: 18
+                        status: "REQUESTED"
+                        chain: null
+
+  /v1/point-types/{pointTypeId}:
+    get:
+      tags: [Point]
+      operationId: getPointType
+      summary: ดู point type หนึ่งอัน
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: pointTypeId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^pt_[0-9a-z]{4,}$' }
+      responses:
+        '200':
+          description: ข้อมูล point type
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PointType' }
+        '404':
+          description: ไม่พบ หรือไม่ใช่ของร้านผู้เรียก · ตอบเหมือนกันทั้งสองกรณี
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [Operation]
+      operationId: getOperation
+      summary: ดูสถานะงาน deploy
+      description: |
+        **เฉพาะ `FINALIZED` เท่านั้นที่แปลว่า point type พร้อมใช้** (RFD 2 D9)
+        `CONFIRMED` ยังย้อนได้ถ้าเกิด reorg
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: สถานะปัจจุบัน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+              examples:
+                เสร็จแล้ว:
+                  value:
+                    operationId: "op_8f2a41"
+                    kind: "POINT_TYPE_CREATE"
+                    status: "FINALIZED"
+                    createdAt: "2026-10-01T09:12:44Z"
+                    finalizedAt: "2026-10-01T09:13:51Z"
+                    steps:
+                      - index: 1
+                        name: "createPointToken"
+                        status: "FINALIZED"
+                        txHash: "0xaa...01"
+                        nonce: 57
+        '404':
+          description: ไม่พบงาน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID v4 ที่ client สร้างเอง · ส่งค่าเดิมเมื่อ retry · เก็บไว้ 72 ชั่วโมง
+      schema: { type: string, minLength: 8, maxLength: 255 }
+      example: "11111111-2222-3333-4444-555555555555"
+
+  schemas:
+    CreatePointTypeRequest:
+      type: object
+      additionalProperties: false
+      required: [name, symbol, decimals]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 60
+          description: ชื่อที่ลูกค้าเห็น · ซ้ำกันในร้านเดียวไม่ได้ (ไม่สนตัวพิมพ์และช่องว่างหน้าหลัง)
+        symbol:
+          type: string
+          pattern: '^[A-Z][A-Z0-9]{1,10}$'
+          description: สัญลักษณ์แบบ ERC-20 · ตัวใหญ่ล้วน 2–11 ตัว
+          examples: ["SUKJAI"]
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 30
+          description: |
+            จำนวนหลักทศนิยมของ token · **ใช้แปลงที่ชั้นแสดงผลเท่านั้น**
+            จำนวนทุกตัวบน wire เป็น base units แบบ string (RFD 14)
+          examples: [18]
+
+    PointTypeStatus:
+      type: string
+      enum: [REQUESTED, LIVE, FAILED, RETIRED]
+      description: |
+        | status | หมายถึง | ออก point ได้ไหม |
+        |---|---|---|
+        | `REQUESTED` | ประกาศแล้ว · ยังไม่มี contract | ไม่ |
+        | `LIVE` | deploy เสร็จ | ได้ |
+        | `FAILED` | deploy ล้ม · ชื่อถูกปล่อยคืน | ไม่ |
+        | `RETIRED` | เลิกใช้ · ยอดเดิมยังอยู่ | ไม่ |
+
+    PointTypeChain:
+      type: object
+      description: ค่าที่มาจาก chain · เป็น null จนกว่า deploy จะ FINALIZED
+      required: [contractAddress, genesisAt, epochSeconds, validityEpochs]
+      properties:
+        contractAddress:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{40}$'
+        genesisAt:
+          type: string
+          format: date-time
+          description: จุดเริ่มนับ epoch · ใช้คำนวณวันหมดอายุของ point แต่ละก้อน (RFD 10)
+        epochSeconds:
+          type: integer
+          minimum: 1
+          description: ความยาวหนึ่ง epoch เป็นวินาที
+          examples: [2592000]
+        validityEpochs:
+          type: integer
+          minimum: 1
+          description: point ที่ได้รับใช้ได้กี่ epoch
+          examples: [4]
+
+    PointType:
+      type: object
+      required: [pointTypeId, name, symbol, decimals, status]
+      properties:
+        pointTypeId: { type: string, examples: ["pt_19bd"] }
+        name:        { type: string }
+        symbol:      { type: string }
+        decimals:    { type: integer }
+        status:      { $ref: '#/components/schemas/PointTypeStatus' }
+        createdAt:   { type: string, format: date-time }
+        chain:
+          oneOf:
+            - $ref: '#/components/schemas/PointTypeChain'
+            - type: 'null'
+
+    CreatePointTypeAccepted:
+      type: object
+      required: [pointTypeId, name, symbol, decimals, status, operationId]
+      properties:
+        pointTypeId: { type: string }
+        name:        { type: string }
+        symbol:      { type: string }
+        decimals:    { type: integer }
+        status:      { const: "REQUESTED" }
+        operationId: { type: string }
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    OperationStep:
+      type: object
+      required: [index, name, status]
+      properties:
+        index:  { type: integer, minimum: 1 }
+        name:   { const: "createPointToken" }
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash: { type: [string, 'null'] }
+        nonce:  { type: [integer, 'null'], minimum: 0 }
+
+    Operation:
+      type: object
+      required: [operationId, kind, status, createdAt, steps]
+      properties:
+        operationId: { type: string }
+        kind:        { const: "POINT_TYPE_CREATE" }
+        status:      { $ref: '#/components/schemas/OperationStatus' }
+        createdAt:   { type: string, format: date-time }
+        finalizedAt: { type: [string, 'null'], format: date-time }
+        errorNote:   { type: [string, 'null'] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - IDEMPOTENCY_KEY_REQUIRED
+                - IDEMPOTENCY_KEY_REUSED
+                - IDEMPOTENCY_KEY_IN_PROGRESS
+                - VALIDATION_FAILED
+                - SYMBOL_TAKEN
+                - NAME_TAKEN
+                - MERCHANT_WALLET_NOT_READY
+                - POINT_TYPE_NOT_FOUND
+                - FORBIDDEN
+                - RATE_LIMITED
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

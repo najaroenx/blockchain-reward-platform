@@ -1,0 +1,100 @@
+erDiagram
+    otp_challenge ||--o{ otp_attempt : "ทุกการเรียก"
+    customer ||--o{ customer_session : "เข้าสู่ระบบ"
+    operation ||--o{ operation_step : "หนึ่งขั้น"
+    operation ||--o{ outbox : "commit พร้อมกัน"
+    operation ||--o{ operation_event : "ทุก transition"
+    operation ||--o| idempotency_key : "คำตอบที่เก็บไว้"
+    signer ||--o{ operation_step : "เซ็น"
+
+    customer {
+        text id PK
+        text phone_e164 "UNIQUE · มาจาก challenge ไม่ใช่จาก request"
+        text display_name
+        customer_status status "PENDING_WALLET ก่อน ACTIVE"
+        timestamptz phone_verified_at "แก้ไม่ได้"
+    }
+
+    wallet {
+        bytea address PK
+        text owner_kind "UNIQUE กับ owner_id"
+        text owner_id
+        text kms_key_ref "kms:// เท่านั้น · ไม่มีคอลัมน์ key และไม่มีวันมี"
+        wallet_status status
+    }
+
+    otp_challenge {
+        text id PK
+        text phone_e164 "UNIQUE เฉพาะที่ยัง PENDING · แก้ไม่ได้"
+        bytea code_hash "HMAC กับ pepper · ไม่มีที่เก็บ OTP เอง"
+        text pepper_ref "kms:// · pepper ไม่อยู่ในฐานข้อมูล"
+        challenge_status status
+        integer attempts "นับการเดา ไม่ใช่การเรียก"
+        integer max_attempts "ค่าตั้งต้น 5"
+        timestamptz expires_at "แก้ไม่ได้ · ยืดอายุย้อนหลังไม่ได้"
+        timestamptz verified_at
+        timestamptz consumed_at "ใช้สมัครได้ครั้งเดียว"
+    }
+
+    otp_attempt {
+        text id PK
+        text challenge_id FK
+        integer attempt_no "UNIQUE กับ challenge_id"
+        attempt_result result "LOCKED และ EXPIRED ไม่นับเป็นการเดา"
+        bytea ip_hash "hash ไม่ใช่ ip"
+    }
+
+    phone_throttle {
+        text phone_e164 PK
+        integer sent_count "5 ครั้งต่อชั่วโมง"
+        timestamptz last_sent_at "รอ 60 วินาทีก่อนขอใหม่"
+        timestamptz locked_until "ใส่ผิดครบครั้ง ล็อก 30 นาที"
+    }
+
+    customer_session {
+        text id PK
+        text customer_id FK
+        bytea token_hash "UNIQUE · ไม่มีคอลัมน์เก็บ token"
+        timestamptz expires_at
+        timestamptz revoked_at
+    }
+
+    idempotency_key {
+        text id PK
+        text scope "UNIQUE กับ key"
+        bytea fingerprint "hash ตรงๆ · ห้าม HMAC (IK-23)"
+        jsonb response_body
+    }
+
+    operation {
+        text id PK
+        text actor_scope
+        operation_kind kind "CUSTOMER_PROVISION"
+        operation_status status "ค้างได้ทีละงานต่อลูกค้า"
+        text subject_id
+    }
+
+    operation_step {
+        text id PK
+        integer step_index "1 เท่านั้น · provisionWallet"
+        text name
+        bytea raw_tx "R2 · commit ก่อน broadcast"
+        step_status status
+    }
+
+    signer {
+        bytea address PK
+        text key_ref "kms:// · ไม่มี private key ในฐานข้อมูล"
+    }
+
+    outbox {
+        text id PK
+        text topic "customer.provision.v1"
+        timestamptz sent_at
+    }
+
+    operation_event {
+        text id PK
+        operation_status to_status
+        actor_type actor
+    }

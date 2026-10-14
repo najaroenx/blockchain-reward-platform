@@ -1,0 +1,67 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant B as browser
+    participant A as api
+    participant H as argon2id
+    participant D as PostgreSQL
+
+    rect rgb(248,249,250)
+    Note over B,D: LOGIN
+    B->>+A: POST /v1/auth/login { email, password }
+    A->>A: normalize email · NFC → trim → lowercase
+    A->>+D: SELECT login_lockout WHERE identifier_hash
+    D-->>-A: ล็อกอยู่ → 423 Retry-After
+    A->>+D: SELECT merchant_admin WHERE email_normalized
+    D-->>-A: แถว หรือ null
+    A->>+H: verify(hash, password)
+    Note right of H: หาอีเมลไม่เจอก็ยังต้อง verify<br/>ด้วย hash ปลอมที่ cost เท่ากัน<br/>ไม่งั้นเวลาตอบบอกคำตอบแทน
+    H-->>-A: true หรือ false
+    alt ล้มเหลว
+        A->>D: INSERT login_attempt succeeded = false
+        A->>D: นับครั้งที่พลาดใน 15 นาที · ถึงเกณฑ์ → upsert login_lockout
+        A-->>B: 401 INVALID_CREDENTIALS
+        Note right of A: รหัสผิด บัญชีถูกปิด ไม่มีอีเมลนี้<br/>ตอบข้อความเดียวกันหมด
+    else สำเร็จ
+        A->>+D: BEGIN
+        A->>D: INSERT auth_session · family ใหม่ · เก็บ sha256 ของ token
+        A->>D: INSERT login_attempt succeeded = true
+        A->>D: DELETE login_lockout
+        A->>D: INSERT auth_event LOGIN_OK
+        D-->>-A: COMMIT
+        A->>A: เซ็น JWT อายุ 15 นาที · ไม่มี role ใน payload
+        A-->>-B: 200 { accessToken } + Set-Cookie refresh HttpOnly
+    end
+    end
+
+    Note over B,D: REFRESH · หมุนทุกครั้ง
+    B->>+A: POST /v1/auth/refresh · cookie refresh token
+    A->>+D: BEGIN
+    A->>D: SELECT auth_session WHERE refresh_token_hash = sha256(token)
+    alt ไม่พบ
+        A-->>B: 401 REFRESH_TOKEN_INVALID
+    else used_at ไม่ว่าง · มีคนใช้ใบนี้ไปแล้ว
+        Note right of D: สองเครื่องถือใบเดียวกัน<br/>เกิดขึ้นได้ทางเดียวคือถูกขโมย
+        A->>D: UPDATE ทั้ง family SET revoked_reason = REUSE_DETECTED
+        A->>D: INSERT auth_event REUSE_DETECTED
+        A-->>B: 401 SESSION_COMPROMISED · ทุกเครื่องหลุดพร้อมกัน
+    else ปกติ
+        A->>D: UPDATE ใบปัจจุบัน SET used_at, revoked_reason = ROTATED
+        A->>D: INSERT ใบใหม่ · parent_id = ใบเดิม
+        Note right of D: uq_session_parent<br/>ใบหนึ่งมีลูกได้ใบเดียว<br/>หมุนซ้ำชนตรงนี้
+        A->>D: INSERT auth_event REFRESH
+        D-->>-A: COMMIT
+        A-->>-B: 200 { accessToken ใหม่ } + Set-Cookie refresh ใหม่
+    end
+
+    Note over B,D: LOGOUT
+    B->>+A: POST /v1/auth/logout
+    A->>D: UPDATE auth_session SET revoked_reason = LOGOUT WHERE id = sid
+    A-->>-B: 204 · เรียกซ้ำก็ได้ 204 เหมือนเดิม

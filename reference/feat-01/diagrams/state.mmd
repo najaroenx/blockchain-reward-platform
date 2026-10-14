@@ -1,0 +1,20 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING : COMMIT ของการสมัครสำเร็จ · คืน 201
+    PENDING --> ACTIVE : provision ทั้ง 2 step FINALIZED
+    PENDING --> PENDING : provision ล้ม · สั่งใหม่ได้
+    ACTIVE --> SUSPENDED : admin ระงับ
+    SUSPENDED --> ACTIVE : ปลดระงับ
+    ACTIVE --> CLOSED : ปิดร้าน
+    SUSPENDED --> CLOSED : ปิดร้าน
+    CLOSED --> [*]
+    note right of PENDING
+        ล็อกอินได้ แก้โปรไฟล์ได้
+        ยังออก point หรือ coupon ไม่ได้
+        endpoint ที่ต้องใช้ chain ตอบ 422
+    end note
+    note right of ACTIVE
+        เขียนได้จาก projector เท่านั้น
+        ไม่มี endpoint ไหนตั้งค่านี้เองได้
+    end note

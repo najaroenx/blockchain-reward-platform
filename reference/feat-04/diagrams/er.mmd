@@ -1,0 +1,58 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT        ||--o{ POINT_TYPE : "ออก point ของตัวเอง"
+    POINT_TYPE      ||--o| POINT_TYPE_CHAIN : "มีได้เมื่อ deploy เสร็จ"
+    IDEMPOTENCY_KEY ||--o| OPERATION : "ชี้ไปที่"
+    OPERATION       ||--|| OPERATION_STEP : "หนึ่ง tx"
+    OPERATION       ||--|| OUTBOX : "ปลุก worker"
+    OPERATION       ||--o{ OPERATION_EVENT : "ทุกการเปลี่ยน"
+    SIGNER          ||--o{ OPERATION_STEP : "เซ็นให้"
+    CHAIN_EVENT     ||--o| OPERATION_STEP : "จับคู่ด้วย tx_hash"
+
+    POINT_TYPE {
+        text id PK
+        text merchant_id FK
+        text name UK "ซ้ำในร้านไม่ได้ ถ้ายังไม่ FAILED"
+        text symbol UK "ตัวใหญ่ 2-11 ตัว"
+        smallint decimals "0-30 · ใช้ตอนแสดงผล"
+        enum status "REQUESTED LIVE FAILED RETIRED"
+        timestamptz live_at
+    }
+    POINT_TYPE_CHAIN {
+        text point_type_id PK
+        bytea contract_address UK "แก้ไม่ได้หลังเขียน"
+        bigint deployed_block
+        bytea deployed_tx_hash
+        timestamptz genesis_at "จุดเริ่มนับ epoch"
+        int epoch_seconds "ความยาวหนึ่ง epoch"
+        int validity_epochs "ใช้ได้กี่ epoch"
+    }
+    OPERATION {
+        text id PK
+        text actor_scope "merchant:mch_xxx"
+        enum kind "POINT_TYPE_CREATE"
+        enum status "PENDING..FINALIZED"
+        text subject_id UK "point_type_id · กันสั่งซ้อน"
+    }
+    OPERATION_STEP {
+        text id PK
+        text operation_id FK
+        int step_index "1 createPointToken"
+        bytea signer_address FK
+        bigint nonce UK
+        bytea raw_tx "COMMIT ก่อน broadcast"
+        bytea tx_hash UK
+    }
+    OUTBOX {
+        text id PK
+        text operation_id FK
+        text topic "point.type.create.v1"
+        timestamptz sent_at "null = ยังไม่มีใครหยิบ"
+    }
+    CHAIN_EVENT {
+        text id PK
+        bytea tx_hash UK
+        int log_index UK
+        bytea block_hash
+        timestamptz applied_at
+    }

@@ -1,0 +1,29 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    state "ใช้ได้" as LIVE
+    state "เตือนแล้ว 30 วัน" as N30
+    state "เตือนแล้ว 7 วัน" as N7
+    state "เตือนแล้ว 1 วัน" as N1
+    state "หมดอายุ" as GONE
+
+    [*] --> LIVE : projector เขียน bucket
+    LIVE --> N30 : เหลือ 30 วัน · job บันทึก notice
+    N30 --> N7 : เหลือ 7 วัน
+    N7 --> N1 : เหลือ 1 วัน
+    LIVE --> GONE : now() เกิน expires_at
+    N30 --> GONE
+    N7 --> GONE
+    N1 --> GONE
+    GONE --> [*]
+    note right of GONE
+        ไม่มีใครเปลี่ยนสถานะนี้
+        ไม่มี event ไม่มี cron
+        เวลาเดินผ่าน expires_at แล้ว
+        query ก็เลิกนับก้อนนี้เอง
+    end note
+    note right of N7
+        uq_notice (bucket_id, threshold_days)
+        ทำให้แจ้งซ้ำระดับเดิมเป็นไปไม่ได้
+        job รันซ้ำกี่รอบลูกค้าก็ได้ข้อความเดียว
+    end note

@@ -1,0 +1,66 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT        ||--o{ COUPON_TYPE : "สร้างประเภทคูปอง"
+    COUPON_TYPE     ||--o| COUPON_TYPE_CHAIN : "มีได้เมื่อ deploy เสร็จ"
+    COUPON_TYPE     ||--o{ COUPON_CODE : "ออกได้ไม่เกิน total_supply"
+    COUPON_TYPE     ||--o{ ISSUE_BATCH : "ออกเป็นชุด"
+    ISSUE_BATCH     ||--o{ COUPON_CODE : "ชุดละหลายใบ"
+    IDEMPOTENCY_KEY ||--o| OPERATION : "ชี้ไปที่"
+    OPERATION       ||--o{ OPERATION_STEP : "step ละไม่เกิน 500 ใบ"
+    OPERATION       ||--|| OUTBOX : "ปลุก worker"
+    OPERATION       ||--o| ISSUE_BATCH : "งานที่ทำให้ชุดนี้"
+    SIGNER          ||--o{ OPERATION_STEP : "เซ็นให้"
+
+    COUPON_TYPE {
+        text id PK
+        text merchant_id FK
+        text name UK "ซ้ำในร้านไม่ได้ ถ้ายังไม่ FAILED"
+        numeric face_value "78,0 · base units"
+        int total_supply "ประกาศแล้วเปลี่ยนไม่ได้"
+        enum status "REQUESTED LIVE FAILED RETIRED"
+        timestamptz expires_at "ต้องหลัง created_at"
+    }
+    COUPON_TYPE_CHAIN {
+        text coupon_type_id PK
+        bytea contract_address UK "แก้ไม่ได้หลังเขียน"
+        numeric chain_type_id UK "78,0"
+        bigint deployed_block
+    }
+    COUPON_CODE {
+        text id PK
+        text coupon_type_id FK
+        bytea code_hash UK "sha256(plaintext) · ใช้ค้นหา"
+        bytea code_ref UK "sha256(id) · ส่งขึ้น chain"
+        enum state "ISSUED HELD REDEEMED EXPIRED VOIDED"
+        enum holder_kind "ต้องมาคู่กับ holder_id"
+        text holder_id
+        text issue_batch_id FK
+    }
+    ISSUE_BATCH {
+        text id PK
+        text coupon_type_id FK
+        text operation_id FK
+        int quantity "1 ถึง 10000"
+    }
+    OPERATION {
+        text id PK
+        enum kind "COUPON_TYPE_CREATE COUPON_ISSUE"
+        enum status "PENDING..FINALIZED"
+        text subject_id UK "coupon_type_id · กัน deploy ซ้อน"
+        jsonb payload "ไม่มีรหัสอยู่ในนี้"
+    }
+    OPERATION_STEP {
+        text id PK
+        text operation_id FK
+        int step_index UK
+        int mint_count "ไม่เกิน 500"
+        bigint nonce UK
+        bytea raw_tx "COMMIT ก่อน broadcast"
+        bytea tx_hash UK
+    }
+    OUTBOX {
+        text id PK
+        text operation_id FK
+        text topic "coupon.issue.v1"
+        timestamptz sent_at
+    }

@@ -1,0 +1,100 @@
+erDiagram
+    merchant ||--o{ webhook_endpoint : "ลงทะเบียนไว้"
+    webhook_endpoint ||--o{ webhook_delivery : "คิวของปลายทางนี้"
+    operation ||--o{ webhook_delivery : "เรื่องที่ส่ง"
+    webhook_delivery ||--o{ webhook_delivery_attempt : "ยิงกี่ครั้ง"
+
+    operation ||--o{ operation_event : "ประวัติ · ต่อเนื่องไม่ขาดช่วง"
+    operation ||--o{ operation_step : "ขั้นของงาน"
+    operation ||--o{ outbox : "commit พร้อมกัน"
+    operation ||--o| idempotency_key : "คำตอบที่เก็บไว้"
+    operation ||--o{ chain_event : "event ที่ตรงกัน"
+
+    merchant {
+        text id PK
+        merchant_status status
+    }
+
+    operation {
+        text id PK
+        text actor_scope "ใช้กรองว่าใครเห็นงานไหน"
+        operation_kind kind
+        operation_status status "ไม่ monotonic · reorg ทำให้ถอยได้"
+        text error_note
+        timestamptz finalized_at
+    }
+
+    operation_event {
+        text id PK
+        text operation_id FK
+        integer seq "UNIQUE กับ operation_id · เพิ่มเสมอ ไม่ขาดช่วง"
+        operation_status from_status "NULL ได้ที่ seq 1 เท่านั้น"
+        operation_status to_status "ต้องตรงกับ from_status ของแถวถัดไป"
+        actor_type actor
+        bytea tx_hash
+    }
+
+    operation_step {
+        text id PK
+        integer step_index "UNIQUE กับ operation_id"
+        text name
+        step_status status
+        bytea tx_hash "UNIQUE"
+    }
+
+    webhook_endpoint {
+        text id PK
+        text merchant_id FK
+        text url "https เท่านั้น"
+        text secret_ref "kms:// เท่านั้น · ไม่เก็บค่าความลับ"
+        text_array event_types "cardinality มากกว่าศูนย์ · ไม่ใช่ array_length"
+        endpoint_status status
+        integer max_attempts "1 ถึง 12"
+    }
+
+    webhook_delivery {
+        text id PK
+        text endpoint_id FK
+        text operation_id FK
+        integer event_seq "UNIQUE กับ endpoint และ operation"
+        integer delivery_seq "ลำดับในคิว · ส่งเรียงตามนี้"
+        text event_type
+        jsonb payload "เซ็นแล้วแก้ไม่ได้"
+        text signature "HMAC ของ signedAt จุด body"
+        timestamptz signed_at
+        delivery_status status "SENT และ DEAD แก้ไม่ได้"
+        integer attempt "ต้องตรงกับจำนวนแถว attempt"
+        timestamptz next_attempt_at "f_backoff ทวีคูณ"
+        timestamptz claimed_at "IN_FLIGHT ต้องมีค่า"
+    }
+
+    webhook_delivery_attempt {
+        text id PK
+        text delivery_id FK
+        integer attempt "UNIQUE กับ delivery_id"
+        timestamptz started_at
+        timestamptz finished_at "ไม่ก่อน started_at"
+        integer response_status "มีอย่างใดอย่างหนึ่งกับ error_note"
+        text response_body
+        text error_note "ไม่มีทั้งสอง หรือมีทั้งสอง ถูกปฏิเสธ"
+    }
+
+    idempotency_key {
+        text id PK
+        text scope "UNIQUE กับ key"
+        bytea fingerprint "hash ตรงๆ · ห้าม HMAC (IK-23)"
+        jsonb response_body
+    }
+
+    outbox {
+        text id PK
+        text topic "ลงท้าย .vN"
+        timestamptz sent_at
+    }
+
+    chain_event {
+        text id PK
+        bytea tx_hash "UNIQUE กับ log_index"
+        integer log_index
+        timestamptz orphaned_at "reorg เขียนที่นี่"
+    }

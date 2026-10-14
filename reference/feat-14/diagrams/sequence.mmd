@@ -1,0 +1,72 @@
+sequenceDiagram
+    autonumber
+    participant Idx as indexer
+    participant Rpc as chain node
+    participant Db as postgres
+    participant Api as api
+
+    Note over Idx,Api: pack นี้เป็นฝั่งตรงข้ามของทุก pack ก่อนหน้า<br/>pack อื่นยิง tx ออกไป · pack นี้อ่านผลที่กลับมา
+
+    rect rgb(238,244,252)
+        Note over Idx,Db: L8 ข้อแรก · instance เดียว · สองชั้น
+        Idx->>Db: pg_try_advisory_lock
+        Note right of Db: กันสอง process ที่ยังมีชีวิต<br/>หายเองเมื่อ connection ตาย
+        Idx->>Db: UPDATE lease_owner · lease_until
+        Note right of Db: กัน process ที่ยังไม่ตายแต่หยุดตอบสนอง<br/>ซึ่ง advisory lock ดักไม่ได้<br/>trg_cursor_needs_lease บังคับ
+    end
+
+    Idx->>Rpc: eth_blockNumber
+    Idx->>Rpc: eth_getBlockByNumber (cursor บวกหนึ่ง)
+
+    alt parent_hash ตรงกับ tip ที่เรามี
+        Idx->>Rpc: eth_getLogs ช่วงบล็อกนั้น
+
+        rect rgb(238,248,240)
+            Note over Idx,Db: L8 ข้อสอง · transaction เดียว
+            Idx->>Db: INSERT raw_block
+            Note right of Db: trg_block_links_to_parent<br/>สายโซ่ที่ขาดเก็บไม่ได้เลย
+            Idx->>Db: INSERT chain_event (ON CONFLICT DO NOTHING)
+            Note right of Db: UNIQUE tx_hash กับ log_index<br/>อ่านช่วงเดิมซ้ำปลอดภัย
+            Idx->>Db: UPDATE cursor
+            Idx->>Db: COMMIT
+            Note right of Db: trg_event_within_cursor ตรวจตอนนี้<br/>มี event เกิน cursor = COMMIT ล้ม
+        end
+
+        Idx->>Db: f_apply_pending()
+        Note right of Db: เรียงตาม block_number แล้ว log_index<br/>สลับลำดับอาจทำให้ยอดติดลบกลางทาง
+
+        Idx->>Db: f_mark_finalized()
+        Note right of Db: บล็อกที่ลึกกว่า N ถือว่าจบ<br/>แล้ว orphan ไม่ได้อีก
+
+    else parent_hash ไม่ตรง · RFD 5
+        Note over Idx,Rpc: เทียบ hash ไม่ใช่นับความลึก<br/>สายที่ยาวกว่าอาจเป็นสายอื่น
+        loop เดินย้อนหาจุดแยก
+            Idx->>Rpc: eth_getBlockByNumber (n)
+            Idx->>Db: SELECT block_hash ที่ความสูง n
+            Note right of Idx: hash ตรงกัน = เจอจุดแยก
+        end
+
+        Idx->>Db: f_handle_reorg(fork_block)
+
+        alt ลึกไม่เกิน N และไม่กิน event ที่ final
+            Note right of Db: ROLLED_BACK
+            Db->>Db: orphan chain_event และ raw_block ตั้งแต่ fork
+            Db->>Db: ถอย cursor ไป fork ลบหนึ่ง
+            Db->>Db: f_replay_projections()
+            Note right of Db: ไม่ย้อนทีละ event · orphan แล้ว replay ใหม่<br/>CouponRedeemed ลบแถว ย้อนตรงๆ ไม่ได้<br/>ช้ากว่า แต่ถูกเสมอ และไม่มีโค้ดเส้นที่สอง
+        else ลึกเกิน N หรือกิน event ที่ final
+            Note right of Db: MANUAL_REVIEW<br/>ไม่แตะอะไรเลย ไม่ orphan ไม่ถอย cursor<br/>trg_final_not_orphanable กันไว้อีกชั้น
+        end
+    end
+
+    Note over Idx,Api: ---- RFD 6 §3.2 · สั่งสร้าง projection ใหม่ ----
+
+    Api->>Db: f_replay_projections()
+    Db->>Db: DELETE coupon_holding · point_balance
+    Db->>Db: UPDATE coupon_code SET state ISSUED
+    Note right of Db: state ก็เป็น projection · พลาดได้ง่าย<br/>เพราะตารางนี้ไม่ได้ชื่อว่าเป็น projection
+    Db->>Db: UPDATE chain_event SET applied_at NULL
+    Db->>Db: f_apply_pending ทั้งหมด
+    Note right of Db: ไม่แตะ Group E · reorg_log คงอยู่<br/>ลบแล้ว replay ไม่ได้เพราะ chain ไม่เคยบอก
+
+    Api-->>Api: เทียบกับ snapshot · ต้องเหมือนเดิมเป๊ะทุกคอลัมน์

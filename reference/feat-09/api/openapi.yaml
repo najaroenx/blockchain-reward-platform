@@ -1,0 +1,336 @@
+openapi: 3.1.0
+info:
+  title: FEAT-09 · Delist
+  version: 1.0.0
+  description: |
+    ร้านถอดรายการขายของตัวเองออกจาก marketplace
+
+    ## สิ่งที่ feature นี้แก้
+
+    `F5` — `delistMarketplaceListing.handler.ts` ของระบบเดิม เมื่อหา listing
+    ไม่เจอ โค้ดเซ็ต `ownerId = merchantId` เองแล้วเดินต่อ แปลว่า
+    "หาไม่เจอ" กลายเป็น "ถือว่าเป็นของคนที่ขอ"
+
+    ที่นี่การตรวจเจ้าของอยู่ใน trigger `trg_delist_admissible` บนตาราง
+    `operation` ไม่ใช่ guard ในโค้ด · เจ้าของอ่านจาก `actor_scope` ที่มาจาก
+    token ที่ผ่าน auth แล้ว ไม่ใช่จาก body ของ request
+
+    ## สองขั้นที่ต้องเรียงกัน
+
+    | ขั้น | tx | ทำอะไร |
+    |---|---|---|
+    | 1 | `cancelListing` | ปิดรายการบน chain · ไม่มีใครซื้อได้อีก |
+    | 2 | `releaseFromVault` | คูปองออกจาก escrow กลับมาที่ผู้ขาย |
+
+    สลับลำดับไม่ได้ · เอาคูปองออกก่อนปิดรายการจะเปิดช่วงที่หน้า marketplace
+    ยังโฆษณาของที่ไม่อยู่ใน escrow แล้ว
+
+    ## การแข่งกับคนซื้อ
+
+    ร้านกดถอดขณะลูกค้ากดซื้อ เป็นเรื่องปกติ ไม่ใช่ข้อยกเว้น
+    `uq_listing_inflight` ให้ผู้ชนะหนึ่งคน — ใครแทรกแถว `operation` ได้ก่อน
+    ผู้แพ้ได้ `409`
+
+    และแม้ฐานข้อมูลรับคำขอถอดไปแล้ว `cancelListing` ยัง revert บน chain ได้
+    ถ้า tx ซื้อลงบล็อกก่อน · operation จบที่ `CHAIN_REVERTED` และรายการ
+    กลายเป็น `SOLD` — **นี่เป็นผลลัพธ์ปกติ ไม่ใช่ error ของระบบ**
+    FEAT-09 เป็น feature แรกที่ `CHAIN_REVERTED` ไม่ใช่เรื่องผิดปกติ
+
+    ## หน่วยเงิน
+
+    `RFD 14 L3` — จำนวนทุกตัวเป็น base units `numeric(78,0)` และส่งบน wire
+    เป็น **string** เสมอ · JSON number พังที่ 2^53
+
+servers:
+  - url: https://api.example.com
+    description: production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: listings
+    description: รายการขายใน marketplace
+  - name: operations
+    description: ติดตามงานที่ส่งไป chain
+
+paths:
+  /v1/listings/{listingId}:
+    get:
+      tags: [listings]
+      summary: ดูรายการขายหนึ่งใบ
+      operationId: getListing
+      parameters:
+        - $ref: '#/components/parameters/ListingId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListingView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    delete:
+      tags: [listings]
+      summary: ถอดรายการขายออกจาก marketplace
+      operationId: delistListing
+      description: |
+        ถอดได้เฉพาะรายการที่สถานะ `ACTIVE` และเป็นของผู้เรียกเอง
+
+        | สถานะรายการ | ผล |
+        |---|---|
+        | `PENDING` | `409 LISTING_NOT_ACTIVE` — ยังไม่มี `chain_listing_id` จะยกเลิกอะไรบน chain ไม่ได้ · ต้องรอให้ขึ้น `ACTIVE` ก่อน |
+        | `ACTIVE` | `202` รับงาน |
+        | `SOLD` | `409 LISTING_NOT_ACTIVE` |
+        | `DELISTED` | `409 LISTING_NOT_ACTIVE` |
+        | `FAILED` | `409 LISTING_NOT_ACTIVE` — ไม่เคยขึ้น chain ไม่มีอะไรต้องถอด |
+
+        รายการที่ไม่ใช่ของผู้เรียก และรายการที่ไม่มีอยู่ ได้ `404` ทั้งคู่
+        ไม่แยกสองกรณีออกจากกันในคำตอบ เพื่อไม่ให้คนนอกเดาได้ว่า
+        `listingId` ไหนมีอยู่จริง · ฐานข้อมูลแยกสองกรณีได้ และบันทึกไว้ใน log
+
+        ถอดสำเร็จแล้วลงขายใบเดิมใหม่ไม่ได้ — ต้องสร้าง listing ใบใหม่
+        เพราะ `chain_listing_id` ของใบเดิมถูกยกเลิกไปแล้ว
+      parameters:
+        - $ref: '#/components/parameters/ListingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: รับงานแล้ว · ติดตามที่ `GET /v1/operations/{operationId}`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelistAccepted' }
+        '200':
+          description: |
+            คำขอเดิมด้วย `Idempotency-Key` เดิม · คืนคำตอบที่บันทึกไว้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelistAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [operations]
+      summary: สถานะงานและขั้นของมัน
+      operationId: getOperation
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[A-Za-z0-9]{6,}$' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ListingId:
+      name: listingId
+      in: path
+      required: true
+      schema: { type: string, pattern: '^lst_[A-Za-z0-9]{6,}$' }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        `SPEC-001` · UUID v4 · เก็บไว้ 72 ชั่วโมง
+
+        `[IK-23]` — fingerprint ของคำขอเป็น hash ตรงๆ ของ `listingId`
+        **ห้ามใช้ salt / secret / HMAC**
+
+        key เดิมกับ `listingId` คนละใบ → `409 IDEMPOTENCY_KEY_REUSED`
+      schema: { type: string, minLength: 8, maxLength: 255 }
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: จำนวนในหน่วยเล็กสุด · string เสมอ (RFD 14 L3)
+      examples: ['80000000000000000000']
+
+    ListingStatus:
+      type: string
+      enum: [PENDING, ACTIVE, SOLD, DELISTED, FAILED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    DelistStepName:
+      type: string
+      enum: [cancelListing, releaseFromVault]
+
+    CloseReason:
+      type: string
+      enum: [CANCELLED, SOLD]
+      description: |
+        เหตุผลที่รายการปิด · มาจาก event บน chain ไม่ได้มาจากความตั้งใจของ api
+        ตั้งค่าแล้วเปลี่ยนไม่ได้ (`trg_listing_chain_immutable`)
+
+    DelistAccepted:
+      type: object
+      required: [listingId, status, operationId, stepCount]
+      properties:
+        listingId: { type: string, pattern: '^lst_[A-Za-z0-9]{6,}$' }
+        status:
+          allOf: [{ $ref: '#/components/schemas/ListingStatus' }]
+          description: |
+            ยัง `ACTIVE` อยู่ตอนรับงาน · เปลี่ยนเป็น `DELISTED` เมื่อ
+            `cancelListing` FINALIZED บน chain แล้วเท่านั้น
+        operationId: { type: string, pattern: '^op_[A-Za-z0-9]{6,}$' }
+        stepCount:
+          type: integer
+          const: 2
+          description: สองขั้น · `cancelListing` แล้ว `releaseFromVault`
+
+    ListingChainView:
+      type: object
+      required: [contractAddress, chainListingId, closeReason]
+      properties:
+        contractAddress: { type: string, pattern: '^0x[0-9a-f]{40}$' }
+        chainListingId: { $ref: '#/components/schemas/BaseUnits' }
+        closeReason:
+          oneOf:
+            - $ref: '#/components/schemas/CloseReason'
+            - type: 'null'
+
+    ListingView:
+      type: object
+      required: [listingId, sellerKind, sellerId, couponTypeId, unitPrice,
+                 quantity, status, chain]
+      properties:
+        listingId: { type: string }
+        sellerKind: { type: string, enum: [MERCHANT, CUSTOMER] }
+        sellerId: { type: string }
+        couponTypeId: { type: string, pattern: '^ct_[A-Za-z0-9]{6,}$' }
+        unitPrice: { $ref: '#/components/schemas/BaseUnits' }
+        quantity: { type: integer, minimum: 1, maximum: 500 }
+        status: { $ref: '#/components/schemas/ListingStatus' }
+        activeAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        closedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        couponCodeIds:
+          type: array
+          description: ผู้ขายเท่านั้นที่เห็นช่องนี้
+          items: { type: string, pattern: '^cc_[A-Za-z0-9]{6,}$' }
+        chain:
+          oneOf:
+            - $ref: '#/components/schemas/ListingChainView'
+            - type: 'null'
+
+    OperationStepView:
+      type: object
+      required: [index, name, status, txHash, nonce]
+      properties:
+        index: { type: integer, minimum: 1, maximum: 2 }
+        name: { $ref: '#/components/schemas/DelistStepName' }
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{64}$' }, { type: 'null' }]
+        nonce:
+          oneOf: [{ type: integer, minimum: 0 }, { type: 'null' }]
+
+    OperationView:
+      type: object
+      required: [operationId, kind, status, createdAt, finalizedAt, steps]
+      properties:
+        operationId: { type: string }
+        kind: { type: string, const: LISTING_DELETE }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        createdAt: { type: string, format: date-time }
+        finalizedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        errorNote:
+          oneOf: [{ type: string }, { type: 'null' }]
+          description: |
+            `CHAIN_REVERTED` พร้อมข้อความนี้ มักหมายถึงมีคนซื้อตัดหน้า
+            ไม่ใช่ความผิดพลาดของระบบ · ดู `status` ของ listing ประกอบ
+        steps:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/OperationStepView' }
+
+    ErrorCode:
+      type: string
+      enum:
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - IDEMPOTENCY_KEY_IN_PROGRESS
+        - VALIDATION_FAILED
+        - LISTING_NOT_FOUND
+        - LISTING_NOT_ACTIVE
+        - LISTING_BUSY
+        - FORBIDDEN
+        - RATE_LIMITED
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string }
+            requestId: { type: string }
+            details: { type: object, additionalProperties: true }
+
+  responses:
+    BadRequest:
+      description: คำขอไม่ถูกรูป · ไม่มี `Idempotency-Key`
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: token ไม่ถูกต้องหรือหมดอายุ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: |
+        ไม่พบรายการขาย **หรือ** รายการนั้นไม่ใช่ของผู้เรียก
+        สองกรณีคืนคำตอบเดียวกันโดยตั้งใจ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        | code | เมื่อไร |
+        |---|---|
+        | `LISTING_NOT_ACTIVE` | รายการไม่ได้อยู่สถานะ `ACTIVE` |
+        | `LISTING_BUSY` | รายการนี้มีงานค้างอยู่ · มักเป็นคนกดซื้อ |
+        | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่คนละ `listingId` |
+        | `IDEMPOTENCY_KEY_IN_PROGRESS` | คำขอเดิมยังทำไม่เสร็จ · ลองใหม่ได้ |
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    RateLimited:
+      description: เรียกถี่เกินไป · ลองใหม่ได้
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }

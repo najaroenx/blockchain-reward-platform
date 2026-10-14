@@ -1,0 +1,78 @@
+sequenceDiagram
+    autonumber
+    actor Buy as ลูกค้า
+    participant Api as api
+    participant Db as postgres
+    participant Wrk as worker
+    participant Ch as chain
+    participant Idx as indexer
+
+    Note over Buy,Idx: ซื้อคูปอง · ตอนรับคำขอ "กันเงิน" ไม่ใช่ "ย้ายเงิน"
+
+    Buy->>Api: POST /v1/listings/lst_x/purchase<br/>expectedTotalPrice · Idempotency-Key
+    Api->>Db: BEGIN
+
+    rect rgb(238,244,252)
+        Note over Api,Db: R1 · สเตตเมนต์แรกเสมอ · ห้าม try/catch
+        Api->>Db: INSERT idempotency_key ON CONFLICT DO NOTHING
+    end
+
+    Api->>Db: SELECT listing · อ่านมาคิดเงิน ไม่ใช่มาตรวจสิทธิ์
+    Api->>Db: SELECT f_fee_bps_at(now())
+    Note right of Api: priceOf() · bigint ทั้งเส้น<br/>fee ปัดลง · เศษตกเป็นของผู้ขาย<br/>ยอดไม่ตรงที่หน้าจอถือ → 409
+
+    rect rgb(252,240,238)
+        Note over Api,Db: ฐานข้อมูลตัดสินสิทธิ์
+        Api->>Db: INSERT operation (LISTING_BUY)
+        Note right of Db: trg_buy_admissible<br/>รายการมีอยู่ · ACTIVE · ไม่ใช่ของตัวเอง<br/>uq_listing_inflight · ไม่มีงานค้าง
+    end
+
+    rect rgb(252,246,232)
+        Note over Api,Db: F4 · จุดที่ระบบเดิมเสกเงินขึ้นมา
+        Api->>Db: INSERT reservation (THB_BALANCE)
+        Note right of Db: trg_thb_reservation_balance<br/>pg_advisory_xact_lock ต่อบัญชี<br/>แล้วเทียบกับ f_available_thb<br/>ไม่พอ = 409 ไม่มีทางอื่น
+    end
+
+    Api->>Db: INSERT purchase (ราคาคัดลอกมาตอนนี้)
+    Note right of Db: trg_purchase_math ตรวจสามทาง<br/>total · fee+net · สูตร fee
+    Api->>Db: INSERT step 1 approveTHB · step 2 executePurchase
+    Api->>Db: INSERT outbox listing.buy.v1
+    Api->>Db: COMMIT
+    Api-->>Buy: 202 purchaseId · feeAmount · netToSeller
+
+    Note over Buy,Idx: ---- ขั้นที่ 1 · อนุมัติเท่ายอดที่ต้องจ่ายพอดี ----
+
+    Wrk->>Db: claim outbox FOR UPDATE SKIP LOCKED
+    Wrk->>Db: UPDATE step 1 SET raw_tx · COMMIT
+    Wrk->>Ch: approveTHB(marketplace, totalPrice)
+    Ch-->>Idx: event Approval
+    Idx->>Db: UPDATE step 1 FINALIZED
+
+    Note over Buy,Idx: ---- ขั้นที่ 2 · เงินและของย้ายใน tx เดียว ----
+
+    Wrk->>Db: UPDATE step 2 SET raw_tx · COMMIT
+    Wrk->>Ch: executePurchase(listingId)
+    Note right of Ch: atomic · THB ไปผู้ขายและ platform<br/>คูปองออกจาก escrow ไปผู้ซื้อ<br/>แยกเป็นสอง tx จะเกิด "จ่ายแล้วไม่ได้ของ"
+
+    alt tx สำเร็จ
+        Ch-->>Idx: event PurchaseSettled
+        Idx->>Db: INSERT chain_event
+
+        rect rgb(238,248,240)
+            Note over Idx,Db: F8 · เงินถึงผู้ขายจริง และพิสูจน์ได้
+            Idx->>Db: INSERT ledger_entry x3 (-total · +net · +fee)
+            Idx->>Db: UPDATE thb_balance ทั้งสามบัญชี
+            Idx->>Db: UPDATE purchase SETTLED · listing SOLD
+            Idx->>Db: INSERT coupon_holding (อ้าง chain_event)
+            Idx->>Db: UPDATE reservation SET released_at
+            Idx->>Db: COMMIT
+            Note right of Db: ตอน COMMIT เท่านั้น<br/>trg_ledger_balanced · รวมได้ศูนย์ไหม<br/>trg_balance_matches_ledger · ยอดตรง ledger ไหม<br/>ไม่ผ่าน = COMMIT ล้ม ทั้งก้อน
+        end
+
+    else tx revert
+        Ch-->>Wrk: revert
+        Wrk->>Db: UPDATE operation CHAIN_REVERTED
+        Wrk->>Db: UPDATE reservation SET released_at
+        Wrk->>Db: UPDATE purchase FAILED
+        Note right of Db: ไม่มี ledger entry เลย<br/>เพราะเงินไม่เคยถูกย้าย<br/>ทางกู้คืนที่ว่างเปล่าคือทางที่ไม่พัง
+    end

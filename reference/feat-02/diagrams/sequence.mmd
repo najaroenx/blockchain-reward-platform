@@ -1,0 +1,67 @@
+sequenceDiagram
+    autonumber
+    actor Cus as ลูกค้า
+    participant Api as api
+    participant Db as postgres
+    participant Kms as KMS
+    participant Sms as ผู้ให้บริการ SMS
+    participant Wrk as worker
+    participant Ch as chain
+
+    Note over Cus,Ch: pack นี้มีข้อเท็จจริงจากระบบเดิมห้าข้อ · F6 F7 F10 F12 F13
+
+    rect rgb(238,244,252)
+        Note over Cus,Sms: ขอ OTP
+        Cus->>Api: POST /v1/auth/otp/request · phone
+        Note right of Api: normalize ทันที · 0812345678 และ +66812345678<br/>และ 66812345678 ได้ค่าเดียวกัน<br/>ไม่ตรงกันจะได้สองบัญชีสำหรับคนเดียว
+        Api->>Kms: ขอ pepper
+        Note right of Api: code_hash = HMAC(pepper, challengeId:code)<br/>ไม่ใช่ sha256 เปล่า · OTP หกหลักมีล้านแบบ<br/>sha256 ของทั้งล้านแบบคำนวณเสร็จในเสี้ยววินาที
+        Api->>Db: UPDATE challenge เก่าเป็น EXPIRED
+        Api->>Db: INSERT otp_challenge (เก็บแต่ code_hash)
+        Note right of Db: trg_throttle_check<br/>รอ 60 วินาที · 5 ครั้งต่อชั่วโมง<br/>ไม่มีข้อนี้ ใครก็ส่ง SMS รบกวนเบอร์คนอื่นฟรี
+        Api->>Db: COMMIT
+        Api->>Sms: ส่ง OTP (หลัง commit)
+        Note right of Api: ส่งก่อน commit แล้ว transaction ล้ม<br/>ลูกค้าได้รหัสที่ใช้ไม่ได้
+        Api-->>Cus: 202 challengeId · expiresAt
+        Note right of Cus: F6 · ไม่มีช่อง OTP ในคำตอบ<br/>ฐานข้อมูลก็ไม่มีที่เก็บ · ไม่มีอะไรให้คืน
+    end
+
+    rect rgb(252,240,238)
+        Note over Cus,Db: ยืนยัน · F7
+        Cus->>Api: POST /v1/auth/otp/verify<br/>challengeId · code
+        Note right of Cus: ไม่มีช่องเบอร์โทรในคำขอ<br/>F7 · ระบบเดิมเขียนทับเบอร์ด้วยค่าจาก body
+        Api->>Kms: ขอ pepper
+        Api->>Db: f_verify_otp(challengeId, code, pepper)
+        Note right of Db: SELECT FOR UPDATE ล็อกแถวไว้<br/>นับครั้ง · ล็อก · เทียบ hash ใน transaction เดียว<br/>แยกหลายคำสั่งจะมีช่องให้ยิงขนานแล้วลองเกิน (F1)<br/><br/>attempts นับ "การเดา" ไม่ใช่ "การเรียก"<br/>เรียกตอนล็อกแล้วไม่ใช่การเดา
+    end
+
+    alt รหัสถูก
+        Db-->>Api: OK · challenge เป็น VERIFIED
+        Api->>Db: set_config app.verified_challenge
+        Api->>Db: INSERT customer
+        Note right of Db: trg_customer_phone_from_challenge<br/>เบอร์ต้องตรงกับ challenge ที่ VERIFIED<br/>F7 ปิดที่ชั้นข้อมูลด้วย ไม่ใช่แค่ชั้น API
+        Api->>Db: INSERT operation CUSTOMER_PROVISION + outbox
+        Api->>Db: INSERT customer_session (เก็บแต่ token_hash)
+        Api-->>Cus: 200 accessToken ทันที
+        Note right of Cus: F12 · ระบบเดิมคืน 201 ไม่มี token<br/>ลูกค้าต้องไป login อีกรอบ
+
+    else รหัสผิด
+        Db-->>Api: WRONG_CODE
+        Api-->>Cus: 401 attemptsLeft
+    else ผิดครบ 5 ครั้ง
+        Db-->>Api: WRONG_CODE · challenge LOCKED
+        Note right of Db: เบอร์ถูกล็อก 30 นาทีด้วย
+        Api-->>Cus: 401 attemptsLeft 0
+    end
+
+    rect rgb(238,248,240)
+        Note over Wrk,Ch: provision wallet · F10 F13 L6
+        Wrk->>Db: claim outbox
+        Wrk->>Kms: createWallet(customerId)
+        Note right of Kms: KMS สร้าง key และเก็บไว้เอง<br/>เราได้แค่ address กับ ref<br/>ไม่มีจุดไหนที่ key ผ่านมือเรา
+        Kms-->>Wrk: address · keyRef
+        Wrk->>Ch: ส่ง tx
+        Wrk->>Db: INSERT wallet (address · kms_key_ref)
+        Note right of Db: ตารางไม่มีคอลัมน์ private key<br/>และ event trigger ปฏิเสธ DDL ที่จะเพิ่มในอนาคต
+        Wrk->>Db: UPDATE customer ACTIVE
+    end

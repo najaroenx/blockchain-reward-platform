@@ -1,0 +1,412 @@
+// =====================================================================
+// FEAT-12 · THB Deposit & Mint · schema.prisma
+//
+// ไฟล์นี้สะท้อน db/migration.sql · migration เป็นต้นฉบับ ไม่ใช่ไฟล์นี้
+//
+// สิ่งที่หายไปถ้าให้ Prisma generate migration เอง
+//   · trg_mint_requires_confirmed_deposit  — หัวใจของ pack นี้
+//   · trg_issuance_only_from_mint          — สิ่งที่ทำให้กฎของ FEAT-10 มีผล
+//   · trg_reversal_outcome_matches_balance — กันการเลือกผลลัพธ์เอง
+//   · constraint trigger ที่ deferred สองตัว
+//   · f_satang_to_base และการตรวจการแปลงหน่วย
+//
+// วิธีใช้
+//   1  psql -d <db> -f db/migration.sql
+//   2  npx prisma db pull   (ตรวจว่าตรงกัน)
+//   3  npx prisma generate
+//   4  ลบโฟลเดอร์ typings/ ทิ้ง
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------ enum
+enum operation_kind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+}
+
+enum operation_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+}
+
+enum step_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+}
+
+enum merchant_status {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum holder_kind {
+  MERCHANT
+  CUSTOMER
+}
+
+enum actor_type {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+}
+
+enum reservation_subject {
+  POINT_BALANCE
+  COUPON_UNIT
+  LISTING
+  THB_BALANCE
+  ESCROW
+}
+
+enum ledger_account {
+  CUSTOMER_THB
+  MERCHANT_THB
+  PLATFORM_THB
+  ISSUANCE
+}
+
+/// เส้นทาง PENDING_PAYMENT → CONFIRMED → MINTED · ข้ามขั้นไม่ได้
+/// trg_deposit_status_transition บังคับ และกันการแก้ยอดหลังยืนยัน
+enum deposit_status {
+  PENDING_PAYMENT
+  CONFIRMED
+  MINTED
+  REVERSED
+  FAILED
+  EXPIRED
+}
+
+/// เลือกเองไม่ได้ · ต้องตรงกับยอดที่ใช้ได้จริงตอนตีกลับ
+enum reversal_outcome {
+  BURNED
+  MANUAL_REVIEW
+}
+
+// ------------------------------------------------------------ ตัวตน
+model merchant {
+  id         String          @id
+  name       String
+  status     merchant_status @default(PENDING)
+  created_at DateTime        @default(now()) @db.Timestamptz(6)
+
+  @@map("merchant")
+}
+
+model customer {
+  id         String   @id
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("customer")
+}
+
+model signer {
+  address    Bytes   @id
+  key_ref    String
+  next_nonce BigInt  @default(0)
+  enabled    Boolean @default(true)
+
+  steps operation_step[]
+
+  @@map("signer")
+}
+
+// ============================================ ฝั่งผู้ให้บริการชำระเงิน
+/// payload ดิบแก้ไม่ได้ · trg_psp_webhook_immutable ยอมให้แก้แค่ processed_at
+///
+/// signature ตรวจด้วย HMAC ซึ่งถูกต้องสำหรับงานนี้
+/// L7 / [IK-23] ห้าม HMAC เฉพาะกับ fingerprint ของ idempotency key
+/// ไม่ได้ห้ามกับลายเซ็น webhook · สองเรื่องนี้คนละเรื่องกัน
+///
+/// แถวที่ลายเซ็นไม่ผ่านยังถูกบันทึก เพื่อให้เห็นว่ามีคนยิงเข้ามา
+/// แต่ ix_psp_unprocessed กรองออกจากคิวงานที่ระดับ schema
+model psp_webhook {
+  id                String    @id
+  provider          String
+  provider_event_id String
+  event_type        String
+  raw_body          Bytes
+  signature         String
+  signature_ok      Boolean
+  received_at       DateTime  @default(now()) @db.Timestamptz(6)
+  processed_at      DateTime? @db.Timestamptz(6)
+
+  deposits  thb_deposit[]
+  reversals deposit_reversal[]
+
+  @@unique([provider, provider_event_id], map: "uq_psp_event")
+  @@map("psp_webhook")
+}
+
+/// amount_satang คือหน่วยเล็กสุดของเงินบาทจริง (1/100 บาท)
+/// amount_base   คือหน่วยเล็กสุดบน chain (10^-18)
+/// ตัวคูณคือ 10^16 คงที่ · trg_deposit_amount_exact ตรวจทุกแถว
+///
+/// provider_ref เป็น idempotency key ตัวจริงของ feature นี้
+/// เราไม่ได้เลือกค่านี้เอง · มันมาจากผู้ให้บริการ
+model thb_deposit {
+  id            String         @id
+  holder_kind   holder_kind
+  holder_id     String
+  provider      String
+  provider_ref  String
+  amount_satang BigInt
+  amount_base   Decimal        @db.Decimal(78, 0)
+  status        deposit_status @default(PENDING_PAYMENT)
+  webhook_id    String?
+  created_at    DateTime       @default(now()) @db.Timestamptz(6)
+  confirmed_at  DateTime?      @db.Timestamptz(6)
+  minted_at     DateTime?      @db.Timestamptz(6)
+  expires_at    DateTime       @db.Timestamptz(6)
+
+  webhook  psp_webhook?      @relation(fields: [webhook_id], references: [id])
+  mint     thb_mint?
+  reversal deposit_reversal?
+
+  @@unique([provider, provider_ref], map: "uq_deposit_provider_ref")
+  @@index([holder_kind, holder_id, created_at], map: "ix_deposit_holder")
+  @@map("thb_deposit")
+}
+
+/// คีย์เป็น deposit_id โดยตั้งใจ · การฝากหนึ่งรายการ mint ได้ครั้งเดียว
+/// ไม่ต้องมี index เพิ่ม ไม่ต้องเขียน trigger · primary key ทำงานนี้เอง
+///
+/// trg_mint_requires_confirmed_deposit ตรวจสามข้อตอน INSERT
+///   การฝากต้อง CONFIRMED · ยอดต้องตรงพอดี · ปลายทางต้องเป็นเจ้าของการฝาก
+model thb_mint {
+  deposit_id     String         @id
+  operation_id   String
+  amount_base    Decimal        @db.Decimal(78, 0)
+  to_account     ledger_account
+  to_account_id  String
+  chain_event_id String?
+  tx_hash        Bytes?
+  minted_block   BigInt?
+  applied_at     DateTime?      @db.Timestamptz(6)
+
+  deposit     thb_deposit  @relation(fields: [deposit_id], references: [id])
+  operation   operation    @relation(fields: [operation_id], references: [id])
+  chain_event chain_event? @relation(fields: [chain_event_id], references: [id])
+
+  @@unique([operation_id], map: "uq_mint_operation")
+  @@map("thb_mint")
+}
+
+/// การตีกลับ · ส่วนที่ตอบยากที่สุดของ feature นี้
+///
+/// ยอดที่ใช้ได้ยังพอ → BURNED · เผา THB คืน ledger สมดุล
+/// ยอดไม่พอ        → MANUAL_REVIEW · ไม่แตะยอด ไม่แต่งตัวเลข
+///
+/// available_at_reversal บันทึกยอดที่ใช้ได้ตอนนั้นไว้
+/// trg_reversal_outcome_matches_balance ปฏิเสธถ้า outcome ไม่ตรงกับยอดนั้น
+/// ทั้งสองทิศทาง — อ้าง BURNED ตอนยอดไม่พอ และอ้าง MANUAL_REVIEW ตอนยอดพอ
+model deposit_reversal {
+  id                    String           @id
+  deposit_id            String           @unique(map: "uq_reversal_deposit")
+  webhook_id            String
+  operation_id          String
+  amount_base           Decimal          @db.Decimal(78, 0)
+  available_at_reversal Decimal          @db.Decimal(78, 0)
+  outcome               reversal_outcome
+  note                  String?
+  created_at            DateTime         @default(now()) @db.Timestamptz(6)
+
+  deposit   thb_deposit @relation(fields: [deposit_id], references: [id])
+  webhook   psp_webhook @relation(fields: [webhook_id], references: [id])
+  operation operation   @relation(fields: [operation_id], references: [id])
+
+  @@map("deposit_reversal")
+}
+
+// ============================================== เงินและสมุดบัญชี (FEAT-10)
+model thb_balance {
+  account    ledger_account
+  account_id String
+  amount     Decimal        @default(0) @db.Decimal(78, 0)
+  updated_at DateTime       @default(now()) @db.Timestamptz(6)
+
+  @@id([account, account_id])
+  @@map("thb_balance")
+}
+
+/// trg_issuance_only_from_mint · กฎที่สำคัญที่สุดของ pack นี้
+///
+/// แถวที่ account = ISSUANCE ต้องมาจาก operation ที่ kind = THB_MINT เท่านั้น
+/// FEAT-10 ตั้งกฎว่า ลบ ISSUANCE = THB ที่หมุนอยู่ในระบบทั้งหมด
+/// ถ้าที่อื่นแตะ ISSUANCE ได้ กฎนั้นก็ไม่มีความหมาย
+model ledger_entry {
+  id           String         @id
+  operation_id String
+  entry_seq    Int
+  account      ledger_account
+  account_id   String
+  asset        String         @default("THB")
+  amount       Decimal        @db.Decimal(78, 0)
+  memo         String?
+  created_at   DateTime       @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id])
+
+  @@unique([operation_id, entry_seq], map: "uq_ledger_seq")
+  @@index([account, account_id, created_at], map: "ix_ledger_account")
+  @@map("ledger_entry")
+}
+
+// -------------------------------------------- Group B · แกน write path
+model idempotency_key {
+  id              String   @id
+  scope           String
+  key             String
+  fingerprint     Bytes
+  operation_id    String?
+  response_status Int?
+  response_body   Json?
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  expires_at      DateTime @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+model operation {
+  id           String           @id
+  actor_scope  String
+  kind         operation_kind
+  status       operation_status @default(PENDING)
+  subject_id   String?
+  payload      Json
+  error_note   String?
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  finalized_at DateTime?        @db.Timestamptz(6)
+
+  steps        operation_step[]
+  outbox       outbox[]
+  reservations reservation[]
+  events       operation_event[]
+  idem_keys    idempotency_key[]
+  chain_events chain_event[]
+  ledger       ledger_entry[]
+  mints        thb_mint[]
+  reversals    deposit_reversal[]
+
+  @@map("operation")
+}
+
+/// mint = หนึ่ง step · ไม่ใช่สองหรือสาม
+/// pack ก่อนๆ มีหลายขั้นเพราะงานนั้นต้องการจริง
+/// เติมขั้นให้ดูเข้าชุดกับ pack อื่นคือการทำผิด
+model operation_step {
+  id             String      @id
+  operation_id   String
+  step_index     Int
+  name           String
+  signer_address Bytes?
+  nonce          BigInt?
+  raw_tx         Bytes?
+  tx_hash        Bytes?
+  status         step_status @default(PENDING)
+  submitted_at   DateTime?   @db.Timestamptz(6)
+  confirmed_at   DateTime?   @db.Timestamptz(6)
+  finalized_at   DateTime?   @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+  signer    signer?   @relation(fields: [signer_address], references: [address])
+
+  @@unique([operation_id, step_index], map: "uq_step_order")
+  @@map("operation_step")
+}
+
+model outbox {
+  id           String    @id
+  operation_id String
+  topic        String
+  payload      Json
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  sent_at      DateTime? @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("outbox")
+}
+
+model reservation {
+  id           String              @id
+  operation_id String
+  subject_type reservation_subject
+  subject_id   String
+  amount       Decimal             @db.Decimal(78, 0)
+  created_at   DateTime            @default(now()) @db.Timestamptz(6)
+  released_at  DateTime?           @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("reservation")
+}
+
+model operation_event {
+  id           String            @id
+  operation_id String
+  from_status  operation_status?
+  to_status    operation_status
+  actor        actor_type        @default(SYSTEM)
+  tx_hash      Bytes?
+  metadata     Json              @default("{}")
+  created_at   DateTime          @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@index([operation_id, created_at], map: "ix_opevent_by_op")
+  @@map("operation_event")
+}
+
+// --------------------------------------------- Group C · ฝั่งอ่าน chain
+model chain_event {
+  id              String    @id
+  block_number    BigInt
+  block_hash      Bytes
+  tx_hash         Bytes
+  log_index       Int
+  address         Bytes
+  topic0          Bytes
+  topics          Json      @default("[]")
+  data            Bytes
+  block_timestamp DateTime  @db.Timestamptz(6)
+  operation_id    String?
+  orphaned_at     DateTime? @db.Timestamptz(6)
+  applied_at      DateTime? @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+  mints     thb_mint[]
+
+  @@unique([tx_hash, log_index], map: "uq_chain_event")
+  @@map("chain_event")
+}

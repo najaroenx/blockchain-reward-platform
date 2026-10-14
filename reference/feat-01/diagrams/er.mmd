@@ -1,0 +1,72 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT        ||--o{ MERCHANT_ADMIN : "มีแอดมินหลายคน"
+    MERCHANT        ||--|| WALLET : "ถือหนึ่งใบ"
+    IDEMPOTENCY_KEY ||--o| OPERATION : "ชี้ไปที่"
+    OPERATION       ||--o{ OPERATION_STEP : "2 ขั้น"
+    OPERATION       ||--|| OUTBOX : "ปลุก worker"
+    OPERATION       ||--o{ OPERATION_EVENT : "ทุกการเปลี่ยน"
+    SIGNER          ||--o{ OPERATION_STEP : "เซ็นให้"
+    CHAIN_EVENT     ||--o| OPERATION_STEP : "จับคู่ด้วย tx_hash"
+
+    MERCHANT {
+        text id PK
+        text name
+        enum status "PENDING ACTIVE SUSPENDED CLOSED"
+        timestamptz created_at
+        timestamptz activated_at "มีค่าก็ต่อเมื่อ ACTIVE"
+    }
+    MERCHANT_ADMIN {
+        text id PK
+        text merchant_id FK
+        text email "ค่าที่ผู้ใช้พิมพ์"
+        text email_normalized UK "NFC trim lowercase"
+        text password_hash "argon2id เท่านั้น"
+        text display_name
+    }
+    WALLET {
+        text id PK
+        bytea address UK
+        text key_ref "ชี้ไป KMS"
+        enum owner_kind UK "MERCHANT CUSTOMER PLATFORM"
+        text owner_id UK
+    }
+    SIGNER {
+        bytea address PK "ของระบบใหม่เท่านั้น"
+        text key_ref
+        bigint next_nonce
+        boolean enabled
+    }
+    IDEMPOTENCY_KEY {
+        text id PK
+        text scope UK "anon:sha256(email)"
+        text key UK "uuid จาก client"
+        bytea fingerprint "sha256 ของ DTO"
+        int response_status
+        jsonb response_body
+        timestamptz expires_at "72 ชม"
+    }
+    OPERATION {
+        text id PK
+        text actor_scope
+        enum kind "MERCHANT_PROVISION"
+        enum status "PENDING..FINALIZED"
+        text subject_id UK "merchant_id · กันสั่งซ้อน"
+        jsonb payload
+    }
+    OPERATION_STEP {
+        text id PK
+        text operation_id FK
+        int step_index "1 whitelist · 2 approval"
+        bytea signer_address FK
+        bigint nonce UK
+        bytea raw_tx "COMMIT ก่อน broadcast"
+        bytea tx_hash UK
+        enum status
+    }
+    OUTBOX {
+        text id PK
+        text operation_id FK
+        text topic "merchant.provision.v1"
+        timestamptz sent_at "null = ยังไม่มีใครหยิบ"
+    }

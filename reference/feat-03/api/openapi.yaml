@@ -1,0 +1,354 @@
+openapi: 3.1.0
+info:
+  title: FEAT-03 · Auth · login, token, refresh
+  version: 1.0.0-draft
+  summary: ล็อกอิน · access token อายุสั้น · refresh token ที่หมุนทุกครั้งและเพิกถอนได้
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 16
+
+    **โครงที่เลือก · JWT อายุสั้น + session ในฐานข้อมูล** (RFD 16 §3.4)
+
+    | | access token | refresh token |
+    |---|---|---|
+    | รูปแบบ | JWT เซ็นด้วย key ของระบบ | ค่าสุ่ม 256 บิต |
+    | อายุ | 15 นาที | 30 วัน |
+    | เก็บในฐานข้อมูลไหม | **ไม่** | เก็บเป็น `sha256` |
+    | เพิกถอนทันทีได้ไหม | ไม่ | ได้ |
+
+    เหตุผล — ถ้าเก็บ access token ลงตารางเพื่อให้เพิกถอนได้ทันที ทุก request
+    จะต้อง query ฐานข้อมูล ซึ่งทำให้ JWT ไม่เหลือข้อดีอะไรเลย
+    การเพิกถอนจึงเกิดที่ชั้น refresh แทน
+
+    **ราคาที่ยอมจ่าย** — ผู้ใช้ที่เพิ่งถูกแบนยังใช้ access token ใบเดิมได้อีกไม่เกิน 15 นาที
+    งานที่รับไม่ได้กับช่องนี้ (เช่นการโอนเงิน) ต้องเช็คสถานะบัญชีสดที่ชั้น service
+
+    **การหมุนและการจับการขโมย**
+
+    ```text
+    login      → tok-1                      (family F)
+    refresh    → tok-1 ใช้แล้ว → ออก tok-2    (family F)
+    refresh    → tok-2 ใช้แล้ว → ออก tok-3    (family F)
+
+    มีคนเอา tok-1 มาใช้อีก
+               → เป็นไปได้ทางเดียวคือถูกขโมย
+               → เพิกถอนทั้ง family F ทันที · ทุกเครื่องหลุดพร้อมกัน
+    ```
+
+    `uq_session_parent` ทำให้ token หนึ่งใบหมุนได้ครั้งเดียวในระดับฐานข้อมูล
+    ไม่ต้องพึ่งโค้ดเช็ค · ดู `tests/acceptance.sql` T2
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Auth
+    description: ล็อกอินและการจัดการ session
+
+paths:
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: ล็อกอินด้วยอีเมลและรหัสผ่าน
+      description: |
+        **ข้อความ error ต้องเหมือนกันทุกกรณีที่ล้มเหลว** (RFD 16 §3.3)
+
+        ไม่ว่าจะเป็นอีเมลไม่มีในระบบ รหัสผ่านผิด หรือบัญชีถูกปิด
+        ตอบ `401 INVALID_CREDENTIALS` ด้วยข้อความเดียวกันทั้งหมด
+        เพราะถ้าแยกข้อความ ผู้โจมตีจะใช้ endpoint นี้ไล่หาว่าอีเมลไหนมีในระบบ
+
+        ด้วยเหตุผลเดียวกัน ต้องรัน argon2id verify แม้หาอีเมลไม่เจอ
+        ไม่งั้นเวลาตอบกลับจะบอกคำตอบแทน
+      parameters:
+        - $ref: '#/components/parameters/UserAgent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            examples:
+              ปกติ:
+                value:
+                  email: "owner@shop.co.th"
+                  password: "correct-horse-battery-staple"
+      responses:
+        '200':
+          description: ล็อกอินสำเร็จ
+          headers:
+            Set-Cookie:
+              description: |
+                refresh token ส่งผ่าน cookie `HttpOnly; Secure; SameSite=Strict; Path=/v1/auth`
+                ไม่ส่งใน body เพื่อให้ JavaScript บนหน้าเว็บอ่านไม่ได้
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+              examples:
+                ปกติ:
+                  value:
+                    accessToken: "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1fMTliZCJ9.xxx"
+                    tokenType: "Bearer"
+                    expiresIn: 900
+                    subject:
+                      kind: "MERCHANT_ADMIN"
+                      id: "adm_19bd"
+                      merchantId: "mch_8f2a41"
+                      merchantStatus: "ACTIVE"
+        '401':
+          description: |
+            อีเมลหรือรหัสผ่านไม่ถูกต้อง · **ข้อความเดียวกันทุกกรณี**
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ล้มเหลว:
+                  value:
+                    error:
+                      code: "INVALID_CREDENTIALS"
+                      message: "อีเมลหรือรหัสผ่านไม่ถูกต้อง"
+                      requestId: "req_01J9X"
+        '423':
+          description: บัญชีถูกล็อกชั่วคราวเพราะใส่รหัสผิดเกินเกณฑ์
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              example: 900
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ถูกล็อก:
+                  value:
+                    error:
+                      code: "ACCOUNT_LOCKED"
+                      message: "ลองใหม่อีกครั้งใน 15 นาที"
+                      requestId: "req_01J9Y"
+        '429':
+          description: เกิน rate limit ต่อ IP
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: ขอ access token ใบใหม่
+      description: |
+        อ่าน refresh token จาก cookie · **ทุกครั้งที่เรียกสำเร็จ token ใบเดิมหมดอายุทันที
+        และได้ใบใหม่กลับไป** (rotation)
+
+        **การจับการขโมย** — ถ้า token ที่ส่งมาเคยถูกใช้ไปแล้ว แปลว่ามีสองเครื่องถือ token
+        ใบเดียวกัน ซึ่งเกิดขึ้นได้ทางเดียวคือถูกขโมย ระบบจะ
+
+        1. เพิกถอนทั้ง family ด้วยเหตุผล `REUSE_DETECTED`
+        2. บันทึก `auth_event`
+        3. ตอบ `401` · ทุกเครื่องในสายนั้นต้องล็อกอินใหม่
+
+        ผู้ใช้จะรู้สึกว่า "อยู่ดีๆ ก็หลุด" ซึ่งถูกต้อง เพราะ token ของเขาอยู่ในมือคนอื่นแล้ว
+      responses:
+        '200':
+          description: ได้ access token ใบใหม่ · refresh token ถูกหมุนแล้ว
+          headers:
+            Set-Cookie:
+              description: refresh token ใบใหม่ · ใบเก่าใช้ไม่ได้อีกต่อไป
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefreshResponse' }
+              examples:
+                ปกติ:
+                  value:
+                    accessToken: "eyJhbGciOiJFUzI1NiJ9.yyy"
+                    tokenType: "Bearer"
+                    expiresIn: 900
+        '401':
+          description: |
+            | code | หมายถึง |
+            |---|---|
+            | `REFRESH_TOKEN_INVALID` | ไม่พบ token นี้ |
+            | `REFRESH_TOKEN_EXPIRED` | เกิน 30 วัน |
+            | `REFRESH_TOKEN_REVOKED` | ถูกเพิกถอนแล้ว |
+            | `SESSION_COMPROMISED` | ตรวจพบการใช้ซ้ำ · ทั้ง family ถูกเพิกถอน |
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ตรวจพบการใช้ซ้ำ:
+                  value:
+                    error:
+                      code: "SESSION_COMPROMISED"
+                      message: "session นี้ถูกยกเลิกเพื่อความปลอดภัย กรุณาเข้าสู่ระบบใหม่"
+                      requestId: "req_01J9Z"
+
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: ออกจากระบบเครื่องนี้
+      description: เพิกถอน session ปัจจุบันด้วยเหตุผล `LOGOUT` · เครื่องอื่นไม่กระทบ
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: ออกจากระบบแล้ว · เรียกซ้ำก็ได้ `204` เหมือนเดิม
+        '401':
+          description: ไม่มี token หรือ token ใช้ไม่ได้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/auth/sessions:
+    get:
+      tags: [Auth]
+      operationId: listSessions
+      summary: ดูเครื่องที่ล็อกอินอยู่
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: รายการ session ที่ยังใช้ได้
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/SessionView' }
+              examples:
+                สองเครื่อง:
+                  value:
+                    sessions:
+                      - sessionId: "ses_19bd"
+                        current: true
+                        createdAt: "2026-10-01T09:00:00Z"
+                        expiresAt: "2026-10-31T09:00:00Z"
+                      - sessionId: "ses_77ac"
+                        current: false
+                        createdAt: "2026-09-20T14:22:00Z"
+                        expiresAt: "2026-10-20T14:22:00Z"
+    delete:
+      tags: [Auth]
+      operationId: revokeAllSessions
+      summary: ออกจากระบบทุกเครื่อง
+      description: เพิกถอนทุก session ของผู้ใช้ รวมถึงเครื่องที่กำลังเรียกอยู่
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: เพิกถอนทั้งหมดแล้ว
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        `Authorization: Bearer <accessToken>`
+
+        payload ของ JWT มีแค่ `sub`, `kind`, `iat`, `exp`, `jti`
+        **ไม่ใส่สิทธิ์หรือ role ลงไป** เพราะถ้าสิทธิ์เปลี่ยนระหว่างทาง
+        token ใบเดิมจะยังถือสิทธิ์เก่าไปอีก 15 นาที (RFD 16 D6)
+
+  parameters:
+    UserAgent:
+      name: User-Agent
+      in: header
+      required: false
+      description: เก็บเป็น hash ไว้ช่วยผู้ใช้ดูว่าเครื่องไหนล็อกอินอยู่
+      schema: { type: string }
+
+  schemas:
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: normalize ด้วย NFC → trim → lowercase ก่อนค้นหา
+        password:
+          type: string
+          minLength: 1
+          maxLength: 256
+
+    SubjectView:
+      type: object
+      required: [kind, id]
+      properties:
+        kind:
+          type: string
+          enum: [MERCHANT_ADMIN, CUSTOMER, PLATFORM_ADMIN]
+        id: { type: string }
+        merchantId:
+          type: [string, 'null']
+          description: มีเฉพาะเมื่อ kind เป็น MERCHANT_ADMIN
+        merchantStatus:
+          type: [string, 'null']
+          enum: [PENDING, ACTIVE, SUSPENDED, CLOSED, null]
+          description: |
+            ส่งมาเพื่อให้ฝั่งหน้าเว็บรู้ว่าร้านพร้อมใช้งานบน chain หรือยัง (FEAT-01)
+            `PENDING` = ล็อกอินได้ แต่ยังออก point หรือ coupon ไม่ได้
+
+    LoginResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn, subject]
+      properties:
+        accessToken: { type: string }
+        tokenType:   { const: "Bearer" }
+        expiresIn:
+          type: integer
+          description: วินาที · 900 = 15 นาที
+          examples: [900]
+        subject: { $ref: '#/components/schemas/SubjectView' }
+
+    RefreshResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn]
+      properties:
+        accessToken: { type: string }
+        tokenType:   { const: "Bearer" }
+        expiresIn:   { type: integer, examples: [900] }
+
+    SessionView:
+      type: object
+      required: [sessionId, current, createdAt, expiresAt]
+      properties:
+        sessionId:  { type: string }
+        current:    { type: boolean, description: true ถ้าเป็นเครื่องที่กำลังเรียกอยู่ }
+        createdAt:  { type: string, format: date-time }
+        expiresAt:  { type: string, format: date-time }
+        userAgent:  { type: [string, 'null'], description: ข้อความย่อที่อ่านได้ ไม่ใช่ค่าเต็ม }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_CREDENTIALS
+                - ACCOUNT_LOCKED
+                - ACCOUNT_DISABLED
+                - REFRESH_TOKEN_INVALID
+                - REFRESH_TOKEN_EXPIRED
+                - REFRESH_TOKEN_REVOKED
+                - SESSION_COMPROMISED
+                - RATE_LIMITED
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

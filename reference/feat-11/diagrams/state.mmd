@@ -1,0 +1,15 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> ISSUED : ออกเป็นชุด
+    ISSUED --> HELD : แจกหรือขายให้ผู้ถือ
+    ISSUED --> VOIDED : merchant ยกเลิกก่อนแจก
+    HELD --> REDEEMED : step 1 burnCoupon FINALIZED
+    HELD --> EXPIRED : now() เกิน expires_at
+    ISSUED --> EXPIRED : now() เกิน expires_at
+    REDEEMED --> [*]
+    note right of REDEEMED
+        ย้อนไม่ได้
+        step 2 ล้ม ก็ยังอยู่สถานะนี้
+        operation เข้า MANUAL_REVIEW แทน
+    end note

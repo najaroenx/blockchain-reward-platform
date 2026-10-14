@@ -1,0 +1,21 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> ISSUED : ออกรหัส · plaintext ส่งออกครั้งเดียว
+    ISSUED --> HELD : แจกหรือขายให้ผู้ถือ
+    ISSUED --> VOIDED : ร้านยกเลิกก่อนแจก
+    HELD --> REDEEMED : ใช้แล้ว · ดู FEAT-11
+    ISSUED --> EXPIRED : เลยวันหมดอายุของประเภท
+    HELD --> EXPIRED : เลยวันหมดอายุของประเภท
+    VOIDED --> [*]
+    REDEEMED --> [*]
+    EXPIRED --> [*]
+    note right of VOIDED
+        ปล่อยโควตาคืน
+        ร้านออกใบใหม่แทนได้
+        trigger นับเฉพาะใบที่ไม่ใช่ VOIDED
+    end note
+    note right of HELD
+        ต้องมีทั้ง holder_kind และ holder_id
+        CHECK บังคับว่าใส่อย่างเดียวไม่ได้
+    end note

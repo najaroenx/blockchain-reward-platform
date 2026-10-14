@@ -1,0 +1,22 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> REQUESTED : COMMIT ของ ADMIT สำเร็จ · คืน 202
+    REQUESTED --> LIVE : deploy FINALIZED · มีแถวใน point_type_chain
+    REQUESTED --> FAILED : deploy ล้ม หรือ MANUAL_REVIEW
+    FAILED --> [*]
+    LIVE --> RETIRED : ร้านเลิกใช้
+    RETIRED --> [*]
+    note right of REQUESTED
+        ชื่อและ symbol ถูกจองแล้ว
+        แต่ยังออก point ไม่ได้
+        ยังไม่มี contract address
+    end note
+    note right of FAILED
+        partial unique index ปล่อยชื่อคืน
+        ร้านใช้ชื่อเดิมสร้างใหม่ได้
+    end note
+    note right of RETIRED
+        ยอดที่ลูกค้าถืออยู่ไม่หาย
+        แค่ออกเพิ่มไม่ได้
+    end note

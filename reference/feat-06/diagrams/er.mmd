@@ -1,0 +1,47 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT   ||--o{ POINT_TYPE : "ออก point"
+    POINT_TYPE ||--|| POINT_TYPE_CHAIN : "ค่าคงที่ของ contract"
+    POINT_TYPE ||--o{ POINT_BALANCE_BUCKET : "ยอดแยกตาม epoch"
+    CUSTOMER   ||--o{ POINT_BALANCE_BUCKET : "ถือยอด"
+    POINT_BALANCE_BUCKET ||--o{ EXPIRY_NOTICE : "แจ้งได้หลายระดับ"
+
+    POINT_TYPE_CHAIN {
+        text point_type_id PK
+        timestamptz genesis_at "จุดเริ่มนับ epoch"
+        int epoch_seconds
+        int validity_epochs
+    }
+    POINT_BALANCE_BUCKET {
+        text id PK
+        text point_type_id UK
+        enum holder_kind UK
+        text holder_id UK
+        int epoch_index UK
+        numeric amount "78,0 · ไม่มีคอลัมน์ยอดคงเหลือ"
+        timestamptz received_at
+        timestamptz expires_at "ต้องหลัง received_at"
+    }
+    RESERVATION {
+        text id PK
+        enum subject_type "POINT_BALANCE"
+        text subject_id "pt|kind|holder"
+        numeric amount "78,0"
+        timestamptz released_at "null = ยังกันอยู่"
+    }
+    EXPIRY_NOTICE {
+        text id PK
+        text bucket_id UK "FK"
+        int threshold_days UK "30 7 1 เท่านั้น"
+        text channel "PUSH EMAIL SMS"
+        timestamptz notified_at
+    }
+    PROJECTION_WATERMARK {
+        boolean id PK "มีได้แถวเดียว"
+        bigint last_block "ถอยหลังไม่ได้"
+        timestamptz last_block_at
+    }
+    INDEXER_CURSOR {
+        bytea contract_address PK
+        bigint last_block "ใช้คำนวณ lag"
+    }

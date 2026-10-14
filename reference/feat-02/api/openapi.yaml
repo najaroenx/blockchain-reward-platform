@@ -1,0 +1,393 @@
+openapi: 3.1.0
+info:
+  title: FEAT-02 · Customer Register + OTP
+  version: 1.0.0
+  description: |
+    ลูกค้าสมัครด้วยเบอร์โทร ยืนยันด้วย OTP แล้วได้ wallet
+
+    pack นี้มีข้อเท็จจริงจากระบบเดิมมากที่สุดในทั้งชุด · ห้าข้อ
+
+    | ข้อ | ระบบเดิม | ที่นี่ |
+    |---|---|---|
+    | `F6` | `createOTP.handler.ts` คืนค่า OTP กลับมาใน response พร้อมคอมเมนต์ `// For testing purposes` | ฐานข้อมูลไม่มีที่เก็บ OTP · ไม่มีอะไรให้คืนแม้จะอยากคืน |
+    | `F7` | `templink.controller.ts` เขียนทับเบอร์โทรด้วยค่าจาก body | endpoint ยืนยันไม่รับเบอร์เลย · เบอร์มาจาก challenge |
+    | `F10` | ระบบถอดรหัส private key ของลูกค้าเองเพื่อเซ็น | ไม่เคยมี key ให้ถอด · การเซ็นเกิดที่ KMS |
+    | `F12` | `bcrypt(password,10)` · เก็บ AES string · คืน `201` ไม่มี token | ไม่มีรหัสผ่าน · ยืนยันแล้วได้ session ทันที |
+    | `F13` | ตาราง `wallet` เก็บ key ที่เข้ารหัสด้วย AES | `wallet` มีแค่ `kms_key_ref` |
+
+    ## "ไม่มีวันมี" ในรูปของกลไก
+
+    `L6` เขียนว่าตาราง `wallet` ไม่มีคอลัมน์ private key **ไม่มีวันมี**
+
+    การไม่สร้างคอลัมน์นั้นวันนี้ ตอบได้แค่ครึ่งเดียว
+    อีกครึ่งคือกันคนที่จะเพิ่มมันในอีกสองปี ด้วยเจตนาดี ตอนที่ไม่มีใครในทีม
+    จำได้ว่าทำไมมันไม่มีตั้งแต่แรก
+
+    `trg_no_secret_columns` เป็น **event trigger** ที่ทำงานชั้น DDL
+    ปฏิเสธ `ALTER TABLE` และ `CREATE TABLE` ที่มีคอลัมน์ชื่อเข้าข่าย
+    ทุกตารางในฐานข้อมูล ไม่ใช่แค่ `wallet`
+
+    ```text
+    ERROR:  ห้ามมีคอลัมน์ private_key ในตาราง wallet (L6)
+    HINT:   key อยู่ใน KMS เท่านั้น · F10 และ F13 เกิดจากการเก็บ key ไว้เอง
+    ```
+
+    ## ลูกค้าไม่มีรหัสผ่าน
+
+    `F12` ใช้ `bcrypt(password,10)` · ที่นี่ไม่มีคอลัมน์รหัสผ่านเลย
+    OTP คือการยืนยันตัวตน
+
+    เหตุผล — รหัสผ่านในแอปที่ใช้เบอร์โทรเป็นหลัก สร้างช่องทางกู้คืนเพิ่มอีกช่อง
+    ซึ่งเป็นช่องที่โจมตีง่ายที่สุด และสุดท้ายการกู้คืนก็กลับมาที่ OTP อยู่ดี
+
+    `merchant_admin` ยังมีรหัสผ่าน (FEAT-03) เพราะคนละบริบท —
+    คนที่เข้าหลังบ้านร้านไม่ได้ถือเบอร์มือถือเครื่องเดียวกันเสมอ
+
+    ## OTP ไม่ออกจาก server
+
+    ฐานข้อมูลเก็บ `code_hash` = `HMAC-SHA256(pepper, challenge_id || ':' || code)`
+    โดย pepper อยู่ใน KMS · ตารางเก็บแค่ `pepper_ref`
+
+    ทำไมไม่ใช้ `sha256` เปล่า — OTP หกหลักมีความเป็นไปได้แค่ล้านแบบ
+    `sha256` ของทั้งล้านแบบคำนวณเสร็จในเสี้ยววินาที ใครได้ฐานข้อมูลไป
+    ก็ย้อนหา OTP ได้ทุกแถว · pepper ที่อยู่นอกฐานข้อมูลทำให้ต้องได้ทั้งสองอย่าง
+
+    **ข้อควรระวัง** · `L7` / `SPEC-001 [IK-23]` ห้ามใช้ salt / secret / HMAC
+    แต่ข้อนั้นพูดถึง **fingerprint ของ idempotency key** เท่านั้น
+    เพราะ fingerprint ต้องคำนวณซ้ำได้โดยไม่ต้องรู้ความลับ
+    การเก็บ OTP เป็นงานตรงข้าม — ต้องให้คนที่ไม่รู้ความลับคำนวณไม่ได้
+
+servers:
+  - url: https://api.example.com
+    description: production
+
+tags:
+  - name: register
+    description: สมัครและยืนยันเบอร์
+
+paths:
+  /v1/auth/otp/request:
+    post:
+      tags: [register]
+      summary: ขอ OTP ไปที่เบอร์โทร
+      operationId: requestOtp
+      security: []
+      description: |
+        ### คำตอบเหมือนกันทุกกรณี
+
+        คืน `202` พร้อม `challengeId` **ไม่ว่าเบอร์นั้นจะสมัครแล้วหรือยัง**
+
+        ถ้าตอบต่างกัน endpoint นี้จะกลายเป็นเครื่องมือตรวจว่าเบอร์ไหน
+        เป็นลูกค้าของเรา · ใครก็ไล่เบอร์ทั้งประเทศได้
+
+        ### ไม่มี OTP ในคำตอบ
+
+        `F6` คืนค่า OTP กลับมาพร้อมคอมเมนต์ว่า for testing
+        ที่นี่ schema ของคำตอบไม่มีช่องนั้น และฐานข้อมูลก็ไม่มีที่เก็บ
+        จึงไม่ใช่เรื่องที่จะเผลอเปิดกลับมาได้
+
+        ### เบอร์ถูก normalize ทันที
+
+        `0812345678` · `+66812345678` · `66812345678` · `081-234-5678`
+        ทั้งสี่รูปได้ `+66812345678` · ถ้า normalize ไม่ตรงกัน
+        คนเดียวจะมีได้สองบัญชี และ `UNIQUE` ก็กันไม่ได้
+
+        ### การจำกัด
+
+        | กฎ | ค่า |
+        |---|---|
+        | รออีกครั้งหลังขอ | 60 วินาที |
+        | ขอได้ต่อชั่วโมง | 5 ครั้ง |
+        | ใส่ผิดได้ | 5 ครั้ง แล้วล็อกเบอร์ 30 นาที |
+
+        ไม่มีข้อนี้ ใครก็ส่ง SMS รบกวนเบอร์คนอื่นได้ฟรีเท่าที่อยาก
+        และค่า SMS เป็นของเรา
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RequestOtpRequest' }
+      responses:
+        '202':
+          description: |
+            ส่ง OTP แล้ว · คำตอบเหมือนกันไม่ว่าเบอร์จะสมัครแล้วหรือยัง
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OtpChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429':
+          description: |
+            ขอถี่เกินไป หรือเบอร์ถูกล็อกจากการใส่ผิดหลายครั้ง
+            `Retry-After` บอกว่ารออีกกี่วินาที
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+
+  /v1/auth/otp/verify:
+    post:
+      tags: [register]
+      summary: ยืนยัน OTP · สมัครให้เลยถ้ายังไม่มีบัญชี
+      operationId: verifyOtp
+      security: []
+      description: |
+        ### ไม่รับเบอร์โทรเป็น parameter เลย
+
+        `F7` คือ endpoint ที่เขียนทับเบอร์ด้วยค่าจาก body
+        ที่นี่ไม่มีเบอร์ให้ส่งมา · รับแค่ `challengeId` กับ `code`
+        เบอร์มาจาก challenge ที่ server สร้างไว้เอง
+
+        และถ้าวันหนึ่งมีใครเติมช่องเบอร์เข้ามาในนี้
+        `trg_customer_phone_from_challenge` จะปฏิเสธถ้าไม่ตรงกับ challenge
+
+        ### ยืนยันสำเร็จแล้วได้ token ทันที
+
+        `F12` คืน `201` ไม่มี token ลูกค้าต้องไป login อีกรอบ
+        ที่นี่ยืนยันเสร็จคือเข้าสู่ระบบแล้ว
+
+        `isNewCustomer` บอกว่าเพิ่งสมัครหรือเป็นการเข้าสู่ระบบ
+        แต่ **คำตอบมีรูปเดียว** ทั้งสองกรณี
+
+        ### wallet มาทีหลัง
+
+        สมัครเสร็จ `customerStatus` เป็น `PENDING_WALLET`
+        งาน `CUSTOMER_PROVISION` ถูกตั้งคิวไว้ และ wallet จะขึ้น chain ทีหลัง
+        ลูกค้าใช้แอปได้เลยระหว่างรอ แค่ยังรับของไม่ได้
+
+        ติดตามที่ `GET /v1/operations/{operationId}` (FEAT-13)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VerifyOtpRequest' }
+      responses:
+        '200':
+          description: ยืนยันสำเร็จ · ได้ session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyOtpResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: |
+            รหัสผิด · `attemptsLeft` บอกว่าเหลืออีกกี่ครั้ง
+            เหลือ `0` แปลว่า challenge ถูกล็อกแล้ว ต้องขอใหม่
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyFailed' }
+        '404':
+          description: ไม่พบ challenge นี้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429':
+          description: challenge ถูกล็อก หรือ OTP หมดอายุ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+
+  /v1/me:
+    get:
+      tags: [register]
+      summary: ข้อมูลของตัวเอง
+      operationId: getMe
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        `SPEC-001` · UUID v4 · `[IK-23]` fingerprint เป็น hash ตรงๆ
+        **ห้ามใช้ salt / secret / HMAC**
+
+        ต่างจาก `code_hash` ของ OTP ซึ่ง **ต้อง** ใช้ HMAC
+        เพราะเป้าหมายต่างกัน — fingerprint ต้องคำนวณซ้ำได้โดยไม่รู้ความลับ
+        `code_hash` ต้องคำนวณไม่ได้ถ้าไม่รู้ความลับ
+      schema: { type: string, minLength: 8, maxLength: 255 }
+
+  schemas:
+    PhoneInput:
+      type: string
+      minLength: 9
+      maxLength: 20
+      description: |
+        รับได้ทุกรูปที่คนพิมพ์ · `0812345678` `+66812345678`
+        `66812345678` `081-234-5678` · server normalize เป็น E.164
+      examples: ['0812345678']
+
+    PhoneE164:
+      type: string
+      pattern: '^\+[1-9][0-9]{7,14}$'
+      description: รูปเดียวที่เก็บในฐานข้อมูล
+      examples: ['+66812345678']
+
+    CustomerStatus:
+      type: string
+      enum: [PENDING_WALLET, ACTIVE, SUSPENDED, CLOSED]
+      description: |
+        `PENDING_WALLET` ยืนยันเบอร์แล้ว รอ wallet ขึ้น chain
+        ใช้แอปได้แล้ว แค่ยังรับของไม่ได้
+
+    RequestOtpRequest:
+      type: object
+      required: [phone]
+      additionalProperties: false
+      properties:
+        phone: { $ref: '#/components/schemas/PhoneInput' }
+
+    OtpChallengeAccepted:
+      type: object
+      required: [challengeId, expiresAt, attemptsAllowed]
+      additionalProperties: false
+      description: |
+        **ไม่มีช่องสำหรับ OTP และจะไม่มี** · `F6`
+
+        `additionalProperties: false` ทำให้การเติมช่องเข้ามาเงียบๆ
+        ทำให้ contract test พัง ไม่ใช่ผ่านไปโดยไม่มีใครเห็น
+      properties:
+        challengeId: { type: string, pattern: '^ch_[A-Za-z0-9]{6,}$' }
+        expiresAt: { type: string, format: date-time }
+        attemptsAllowed: { type: integer, minimum: 1, maximum: 10 }
+
+    VerifyOtpRequest:
+      type: object
+      required: [challengeId, code]
+      additionalProperties: false
+      description: |
+        **ไม่มีช่องเบอร์โทร และจะไม่มี** · `F7`
+        เบอร์มาจาก challenge ที่ server สร้างไว้เอง
+      properties:
+        challengeId: { type: string, pattern: '^ch_[A-Za-z0-9]{6,}$' }
+        code: { type: string, pattern: '^[0-9]{6}$' }
+        displayName:
+          type: string
+          maxLength: 80
+          description: ใส่ได้เฉพาะตอนสมัครครั้งแรก · ไม่ใช่ช่องที่ยืนยันตัวตน
+
+    VerifyOtpResult:
+      type: object
+      required: [customerId, phone, customerStatus, isNewCustomer,
+                 accessToken, expiresAt]
+      properties:
+        customerId: { type: string, pattern: '^cus_[A-Za-z0-9]{6,}$' }
+        phone:
+          allOf: [{ $ref: '#/components/schemas/PhoneE164' }]
+          description: มาจาก challenge ไม่ใช่จากคำขอ
+        customerStatus: { $ref: '#/components/schemas/CustomerStatus' }
+        isNewCustomer:
+          type: boolean
+          description: |
+            เพิ่งสมัคร หรือเป็นการเข้าสู่ระบบ · คำตอบมีรูปเดียวทั้งสองกรณี
+        accessToken:
+          type: string
+          description: |
+            `F12` คืน `201` ไม่มี token · ที่นี่ยืนยันเสร็จคือเข้าสู่ระบบแล้ว
+            ฐานข้อมูลเก็บแต่ `token_hash` · ไม่มีคอลัมน์เก็บ token
+        expiresAt: { type: string, format: date-time }
+        operationId:
+          oneOf: [{ type: string, pattern: '^op_[A-Za-z0-9]{6,}$' }, { type: 'null' }]
+          description: งาน provision wallet · มีค่าเมื่อเพิ่งสมัคร
+
+    VerifyFailed:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId, attemptsLeft]
+          properties:
+            code: { type: string, const: OTP_WRONG }
+            message: { type: string }
+            requestId: { type: string }
+            attemptsLeft:
+              type: integer
+              minimum: 0
+              description: เหลือ `0` แปลว่าถูกล็อกแล้ว · ต้องขอ OTP ใหม่
+
+    MeView:
+      type: object
+      required: [customerId, phone, customerStatus, walletAddress]
+      properties:
+        customerId: { type: string }
+        phone: { $ref: '#/components/schemas/PhoneE164' }
+        displayName:
+          oneOf: [{ type: string }, { type: 'null' }]
+        customerStatus: { $ref: '#/components/schemas/CustomerStatus' }
+        walletAddress:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{40}$' }, { type: 'null' }]
+          description: |
+            `null` ระหว่างรอ provision
+
+            **ไม่มีช่องใดในคำตอบนี้ที่เกี่ยวกับ private key** · `F10` `F13` `L6`
+            ระบบไม่เคยเห็น key · การเซ็นเกิดที่ KMS โดยส่ง digest ไปให้เซ็น
+
+    ErrorCode:
+      type: string
+      enum:
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - VALIDATION_FAILED
+        - PHONE_INVALID
+        - OTP_WRONG
+        - OTP_EXPIRED
+        - OTP_LOCKED
+        - OTP_ALREADY_USED
+        - CHALLENGE_NOT_FOUND
+        - RATE_LIMITED
+        - UNAUTHORIZED
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string }
+            requestId: { type: string }
+
+  responses:
+    BadRequest:
+      description: คำขอไม่ถูกรูป · เบอร์ไม่ใช่รูปที่รู้จัก
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: token ไม่ถูกต้องหรือหมดอายุ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        | code | เมื่อไร |
+        |---|---|
+        | `OTP_ALREADY_USED` | challenge นี้ยืนยันหรือใช้สมัครไปแล้ว |
+        | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body คนละชุด |
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }

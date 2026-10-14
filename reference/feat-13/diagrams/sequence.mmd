@@ -1,0 +1,73 @@
+sequenceDiagram
+    autonumber
+    actor Shop as ร้าน
+    participant Api as api
+    participant Db as postgres
+    participant Idx as indexer
+    participant Wrk as webhook worker
+    participant Hook as ปลายทางของร้าน
+
+    Note over Shop,Hook: สองทางที่ร้านรู้สถานะ · ดึง และ ส่ง
+
+    rect rgb(238,244,252)
+        Note over Shop,Db: ทางที่หนึ่ง · ดึง
+        Shop->>Api: GET /v1/operations/op_x<br/>If-None-Match
+        Api->>Db: อ่าน operation + steps + events
+        Note right of Db: สถานะอ่านจาก event แถวสุดท้าย<br/>ไม่ใช่จากช่อง operation.status<br/>สองค่านี้ตรงกันอยู่แล้วแต่อ่านจาก event<br/>ทำให้ API กับสิ่งที่ client ควรเชื่อเป็นอันเดียวกัน
+        Api-->>Shop: 200 + ETag + Retry-After<br/>หรือ 304 ถ้า seq ไม่เปลี่ยน
+    end
+
+    Note over Shop,Hook: ---- สถานะเปลี่ยนจริง ----
+
+    Idx->>Db: advance(op_x, SUBMITTED)
+
+    rect rgb(252,240,238)
+        Note over Idx,Db: ทุกการเปลี่ยนสถานะเขียนสองที่ใน transaction เดียว
+        Idx->>Db: UPDATE operation SET status
+        Idx->>Db: INSERT operation_event (seq, from, to)
+        Note right of Db: trg_opevent_chain_intact<br/>seq ต้องต่อจากแถวก่อนพอดี<br/>from_status ต้องตรงกับ to_status แถวก่อน<br/><br/>trg_status_has_event ตอน COMMIT<br/>เปลี่ยนสถานะโดยไม่เขียน event = COMMIT ล้ม
+    end
+
+    rect rgb(252,246,232)
+        Note over Idx,Db: ตั้งคิวส่งให้ทุก endpoint ที่สนใจ
+        Idx->>Db: INSERT webhook_delivery<br/>payload + signature + signed_at
+        Note right of Db: เซ็นตอนนี้ เก็บทั้ง body และลายเซ็น<br/>trg_delivery_terminal_immutable ไม่ยอมให้แก้ทีหลัง<br/><br/>trg_delivery_event_exists<br/>ส่งเรื่องที่ไม่ได้เกิดขึ้นไม่ได้
+    end
+
+    Note over Shop,Hook: ---- ทางที่สอง · ส่ง ----
+
+    Wrk->>Db: claim · FOR UPDATE SKIP LOCKED<br/>WHERE PENDING AND next_attempt_at <= now()
+    Note right of Db: trg_delivery_order_gate<br/>ลำดับก่อนหน้าต้องจบ (SENT หรือ DEAD)<br/>worker ไม่ต้องเรียงเอง และเรียงผิดไม่ได้
+
+    Wrk->>Hook: POST url<br/>X-Signature sha256 ของ signedAt จุด body
+
+    alt ร้านตอบ 2xx
+        Hook-->>Wrk: 200
+        Wrk->>Db: INSERT attempt (response_status 200)
+        Wrk->>Db: UPDATE delivery SENT
+        Note right of Db: trg_attempt_count_matches ตอน COMMIT<br/>attempt ต้องตรงกับจำนวนแถวจริง
+    else ร้านตอบ 5xx หรือไม่ตอบ
+        Hook-->>Wrk: 500 หรือ timeout
+        Wrk->>Db: INSERT attempt (response_status 500 หรือ error_note)
+        Note right of Db: ck_attempt_outcome<br/>ต้องมีคำตอบหรือ error อย่างใดอย่างหนึ่ง<br/>ไม่ใช่ทั้งสอง และไม่ใช่ไม่มีเลย
+
+        alt ยังไม่ครบ max_attempts
+            Wrk->>Db: UPDATE PENDING · next_attempt_at = now + f_backoff(n)
+            Note right of Db: 1 → 1 นาที · 6 → 32 นาที · เพดาน 60
+        else ครบแล้ว
+            Wrk->>Db: UPDATE DEAD
+            Note right of Db: ไม่บล็อกลำดับถัดไป<br/>รับไม่ได้ครั้งหนึ่ง ไม่ควรแปลว่าไม่ได้รับอะไรอีกตลอดกาล
+        end
+    end
+
+    Note over Shop,Hook: ---- ร้านมาดูว่าทำไมไม่ได้รับ ----
+
+    Shop->>Api: GET /v1/webhook-endpoints/ep_1/deliveries
+    Api->>Db: อ่าน delivery + attempts
+    Note right of Db: Group E · เก็บคำตอบที่ร้านตอบกลับมาจริง<br/>เวลาที่ใช้ · error ที่เจอ<br/>chain ไม่รู้เรื่องพวกนี้ และจะไม่มีวันรู้
+    Api-->>Shop: 200 ประวัติการยิงทุกครั้ง
+
+    Shop->>Api: POST /v1/webhook-deliveries/wd_x/replay
+    Note right of Api: สร้างแถวใหม่ · ไม่ปลุกแถวเดิม<br/>แถวเดิมเป็นหลักฐาน แก้ย้อนหลังได้ก็เลิกเป็นหลักฐาน
+    Api->>Db: INSERT webhook_delivery (delivery_seq ถัดไป)
+    Api-->>Shop: 202

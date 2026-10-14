@@ -1,0 +1,73 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant A as api
+    participant D as PostgreSQL
+    participant W as worker
+    participant N as chain
+    participant I as indexer
+    participant P as projector
+
+    rect rgb(248,249,250)
+    Note over C,D: ADMIT · api · transaction เดียว ไม่มี external call
+    C->>+A: POST /v1/point-types · Idempotency-Key · { name, symbol, decimals }
+    A->>A: validate · symbol ตัวใหญ่ 2-11 · decimals 0-30
+    A->>+D: BEGIN
+    A->>D: INSERT idempotency_key ON CONFLICT DO NOTHING
+    alt 0 rows · เคยเห็น key นี้
+        D-->>A: แถวเดิม → 409 หรือ replay
+    else 1 row · ครั้งแรก
+        A->>D: INSERT point_type · status REQUESTED
+        Note right of D: trigger เช็คว่าร้าน ACTIVE<br/>ไม่ใช่แค่ guard ใน api
+        Note right of D: uq_point_symbol · uq_point_name<br/>ชนตรงนี้ → 409 ไม่ต้อง SELECT ก่อน
+        A->>D: INSERT operation POINT_TYPE_CREATE · PENDING
+        A->>D: INSERT operation_step 1 createPointToken
+        A->>D: INSERT outbox · point.type.create.v1
+        A->>D: UPDATE idempotency_key SET response 202
+        D-->>-A: COMMIT
+    end
+    end
+    A-->>-C: 202 { pointTypeId, status REQUESTED, operationId }
+    Note over C,A: ชื่อและ symbol ถูกจองแล้ว แม้ chain ยังไม่ทำอะไร
+
+    Note over W,N: DEPLOY · worker · หนึ่ง tx
+    W->>+D: claim outbox WHERE sent_at IS NULL FOR UPDATE SKIP LOCKED
+    D-->>-W: operation
+    W->>D: SELECT next_nonce FROM signer FOR UPDATE
+    W->>W: build raw_tx · factory.createPointToken(name, symbol, decimals)
+    W->>D: UPDATE step 1 SET raw_tx nonce · COMMIT ก่อน broadcast
+    W->>+N: eth_sendRawTransaction
+    N-->>-W: tx_hash
+    W->>D: UPDATE step 1 → SUBMITTED
+
+    Note over I,N: OBSERVE · indexer · instance เดียว
+    I->>+N: eth_getLogs fromBlock = cursor
+    N-->>-I: PointTokenCreated · address, genesis, epoch
+    I->>D: INSERT chain_event ON CONFLICT (tx_hash, log_index) DO NOTHING
+    I->>D: UPDATE indexer_cursor · transaction เดียวกัน
+
+    Note over P,D: PROJECT · เขียนสองตารางคนละความหมาย
+    P->>+D: chain_event WHERE applied_at IS NULL
+    D-->>-P: event
+    alt step FINALIZED · ผ่าน N block และ block_hash ยังอยู่
+        P->>D: INSERT point_type_chain · address, genesis_at, epoch_seconds
+        Note right of D: ค่าทั้งหมด derive จาก event<br/>ห้ามอ่านจาก point_type มาใส่
+        P->>D: UPDATE point_type → LIVE · live_at
+        P->>D: operation → FINALIZED
+    else deploy ล้ม
+        P->>D: UPDATE point_type → FAILED
+        Note right of D: partial index ปล่อยชื่อคืน<br/>ร้านใช้ชื่อเดิมสร้างใหม่ได้
+        P->>D: operation → CHAIN_REVERTED
+    end
+
+    C->>+A: GET /v1/point-types/id
+    A->>D: SELECT point_type LEFT JOIN point_type_chain
+    A-->>-C: { status LIVE, chain: { contractAddress, genesisAt, epochSeconds } }

@@ -1,0 +1,470 @@
+openapi: 3.1.0
+info:
+  title: FEAT-07 · Create Coupon Type + Issue Codes
+  version: 1.0.0-draft
+  summary: ร้านสร้างประเภทคูปอง แล้วออกรหัสเป็นชุด
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 11
+
+    **เรื่องสำคัญที่สุดของ feature นี้ · รหัสคูปองไม่เคยถูกเก็บลงฐานข้อมูล**
+
+    | สิ่งที่เก็บ | คืออะไร | ใช้ทำอะไร |
+    |---|---|---|
+    | `code_hash` | `sha256(plaintext)` | ค้นหาตอนลูกค้ายื่นรหัสมา |
+    | `code_ref` | `sha256(id)` | ส่งขึ้น chain |
+    | plaintext | **ไม่เก็บ** | คืนครั้งเดียวตอนออก · หายแล้วหายเลย |
+
+    **ทำไม `code_ref` ไม่ใช่ hash ของ plaintext**
+
+    indexer และ projector ไม่เคยเห็น plaintext เลย ถ้า `code_ref` มาจาก plaintext
+    พวกมันจะจับคู่ event บน chain กลับมาหาแถวในฐานข้อมูลไม่ได้
+    ใช้ `sha256(id)` แทน ทำให้ทุกฝ่ายคำนวณค่าเดียวกันได้โดยไม่ต้องรู้รหัส
+
+    `trg_code_ref_derived` บังคับข้อนี้ที่ฐานข้อมูล — เขียนค่าอื่นลง `code_ref` ไม่ได้เลย
+
+    **รหัสคืนครั้งเดียว** — response ของการออกชุดจะมี plaintext ของทุกใบ
+    และนั่นคือครั้งเดียวที่ระบบส่งค่านั้นออกไป ถ้าผู้เรียกทำหาย ต้องยกเลิกแล้วออกใหม่
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Coupon
+    description: ประเภทคูปองและการออกรหัส
+  - name: Operation
+    description: ติดตามงาน async
+
+paths:
+  /v1/coupon-types:
+    post:
+      tags: [Coupon]
+      operationId: createCouponType
+      summary: สร้างประเภทคูปอง
+      description: |
+        **ร้านต้องเป็น `ACTIVE` ก่อน** · บังคับด้วย trigger ในฐานข้อมูล ไม่ใช่แค่ guard ในโค้ด
+
+        `totalSupply` ประกาศตอนสร้างแล้วเปลี่ยนไม่ได้ · ออกรหัสเกินจำนวนนี้ไม่ได้
+
+        **1 step บน chain** — `factory.createCouponType(faceValue, totalSupply, expiresAt)`
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCouponTypeRequest' }
+            examples:
+              ปกติ:
+                value:
+                  name: "คูปองส่วนลด 100 บาท"
+                  faceValue: "100000000000000000000"
+                  totalSupply: 500
+                  expiresAt: "2027-03-31T16:59:59Z"
+      responses:
+        '202':
+          description: รับงานแล้ว · ยังออกรหัสไม่ได้จนกว่าจะ LIVE
+          headers:
+            Location:
+              schema: { type: string }
+              example: /v1/operations/op_8f2a41
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CouponTypeAccepted' }
+              examples:
+                ปกติ:
+                  value:
+                    couponTypeId: "ct_19bd"
+                    name: "คูปองส่วนลด 100 บาท"
+                    faceValue: "100000000000000000000"
+                    totalSupply: 500
+                    status: "REQUESTED"
+                    expiresAt: "2027-03-31T16:59:59Z"
+                    operationId: "op_8f2a41"
+        '400':
+          description: |
+            header `Idempotency-Key` หาย หรือ body ผิดรูป
+
+            `faceValue` ต้องเป็น string ของเลขจำนวนเต็ม (RFD 14)
+            `expiresAt` ต้องอยู่ในอนาคต · `totalSupply` ต้องอยู่ในช่วง 1–1,000,000
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                วันหมดอายุย้อนหลัง:
+                  value:
+                    error:
+                      code: "VALIDATION_FAILED"
+                      message: "expiresAt ต้องอยู่ในอนาคต"
+                      requestId: "req_01J9X"
+                      details:
+                        field: "expiresAt"
+        '409':
+          description: ชื่อซ้ำในร้านเดียวกัน หรือ Idempotency-Key ซ้ำแต่ body ต่าง
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ชื่อซ้ำ:
+                  value:
+                    error:
+                      code: "NAME_TAKEN"
+                      message: "ร้านของคุณใช้ชื่อนี้ไปแล้ว"
+                      requestId: "req_01J9Y"
+        '422':
+          description: ร้านยังไม่พร้อม · provision wallet จาก FEAT-01 ยังไม่เสร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Coupon]
+      operationId: listCouponTypes
+      summary: ดูประเภทคูปองทั้งหมดของร้าน
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/CouponTypeStatus' }
+      responses:
+        '200':
+          description: รายการประเภทคูปอง
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [couponTypes]
+                properties:
+                  couponTypes:
+                    type: array
+                    items: { $ref: '#/components/schemas/CouponType' }
+              examples:
+                หนึ่งอันพร้อมใช้:
+                  value:
+                    couponTypes:
+                      - couponTypeId: "ct_19bd"
+                        name: "คูปองส่วนลด 100 บาท"
+                        faceValue: "100000000000000000000"
+                        totalSupply: 500
+                        issuedCount: 320
+                        remainingSupply: 180
+                        status: "LIVE"
+                        expiresAt: "2027-03-31T16:59:59Z"
+                        chain:
+                          contractAddress: "0xaaaa...aaaa"
+                          chainTypeId: "7"
+
+  /v1/coupon-types/{couponTypeId}/codes:
+    post:
+      tags: [Coupon]
+      operationId: issueCouponCodes
+      summary: ออกรหัสคูปองเป็นชุด
+      description: |
+        **รหัส plaintext ถูกส่งคืนครั้งเดียวในนี้** · ระบบไม่เก็บไว้ที่ไหน
+        ผู้เรียกต้องบันทึกเองทันที ถ้าทำหายต้องยกเลิกใบนั้นแล้วออกใหม่
+
+        **ออกเกิน `totalSupply` ไม่ได้** · บังคับด้วย trigger ที่ล็อกเฉพาะประเภทนั้น
+        แล้วตรวจผลรวม ไม่ใช่ `SELECT` มาเช็คก่อน
+
+        ใบที่ถูกยกเลิก (`VOIDED`) ปล่อยโควตาคืนให้ออกใบใหม่ได้
+
+        **mint เป็นชุดบน chain** · tx ละไม่เกิน 500 ใบ
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: couponTypeId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^ct_[0-9a-z]{4,}$' }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueRequest' }
+            examples:
+              ออก 3 ใบ:
+                value:
+                  quantity: 3
+      responses:
+        '202':
+          description: |
+            รับงานแล้ว · **รหัสในนี้คือครั้งเดียวที่ระบบส่งออกมา**
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssueAccepted' }
+              examples:
+                สามใบ:
+                  value:
+                    batchId: "ib_19bd"
+                    couponTypeId: "ct_19bd"
+                    operationId: "op_8f2a41"
+                    quantity: 3
+                    stepCount: 1
+                    codes:
+                      - couponCodeId: "cc_a1b2"
+                        code: "7KQ4-M2XB-91TN"
+                      - couponCodeId: "cc_c3d4"
+                        code: "H8ZR-4VWY-6PK2"
+                      - couponCodeId: "cc_e5f6"
+                        code: "3TBN-J7QM-X59D"
+                    warning: "รหัสเหล่านี้จะไม่ถูกส่งอีก กรุณาบันทึกทันที"
+        '409':
+          description: Idempotency-Key ซ้ำแต่ body ต่าง หรือคำขอก่อนหน้ายังไม่จบ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            | code | หมายถึง |
+            |---|---|
+            | `SUPPLY_EXCEEDED` | ออกเกินจำนวนที่ประกาศไว้ |
+            | `COUPON_TYPE_NOT_LIVE` | ประเภทยังไม่ `LIVE` หรือ `RETIRED` แล้ว |
+            | `COUPON_TYPE_EXPIRED` | ประเภทหมดอายุไปแล้ว |
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                เกินโควตา:
+                  value:
+                    error:
+                      code: "SUPPLY_EXCEEDED"
+                      message: "ออกได้อีก 180 ใบเท่านั้น"
+                      requestId: "req_01J9Z"
+                      details:
+                        requested: 200
+                        remaining: 180
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [Operation]
+      operationId: getOperation
+      summary: ดูสถานะงาน
+      description: |
+        **เฉพาะ `FINALIZED` เท่านั้นที่แปลว่าเสร็จ** (RFD 2 D9)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: สถานะปัจจุบัน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '404':
+          description: ไม่พบงาน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID v4 ที่ client สร้างเอง · ส่งค่าเดิมเมื่อ retry · เก็บไว้ 72 ชั่วโมง
+      schema: { type: string, minLength: 8, maxLength: 255 }
+      example: "11111111-2222-3333-4444-555555555555"
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: จำนวนเต็มในหน่วยเล็กสุด ส่งเป็น string เสมอ (RFD 14)
+      examples: ["100000000000000000000"]
+
+    CreateCouponTypeRequest:
+      type: object
+      additionalProperties: false
+      required: [name, faceValue, totalSupply, expiresAt]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: ซ้ำกันในร้านเดียวไม่ได้ · ไม่สนตัวพิมพ์และช่องว่างหน้าหลัง
+        faceValue:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: มูลค่าหน้าคูปอง เป็น base units ของ THB
+        totalSupply:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: จำนวนสูงสุดที่ออกได้ · **ประกาศแล้วเปลี่ยนไม่ได้**
+        expiresAt:
+          type: string
+          format: date-time
+          description: ต้องอยู่ในอนาคต
+
+    CouponTypeStatus:
+      type: string
+      enum: [REQUESTED, LIVE, FAILED, RETIRED]
+      description: |
+        | status | ออกรหัสได้ไหม |
+        |---|---|
+        | `REQUESTED` | ไม่ · ยังไม่มี contract |
+        | `LIVE` | ได้ |
+        | `FAILED` | ไม่ · ชื่อถูกปล่อยคืนแล้ว |
+        | `RETIRED` | ไม่ · ใบที่ออกไปแล้วยังใช้ได้ |
+
+    CouponTypeChain:
+      type: object
+      required: [contractAddress, chainTypeId]
+      properties:
+        contractAddress: { type: string, pattern: '^0x[0-9a-fA-F]{40}$' }
+        chainTypeId:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: id ของประเภทคูปองบน contract
+
+    CouponType:
+      type: object
+      required: [couponTypeId, name, faceValue, totalSupply, status, expiresAt]
+      properties:
+        couponTypeId: { type: string }
+        name:         { type: string }
+        faceValue:    { $ref: '#/components/schemas/BaseUnits' }
+        totalSupply:  { type: integer }
+        issuedCount:
+          type: integer
+          description: จำนวนที่ออกไปแล้ว ไม่นับใบที่ยกเลิก
+        remainingSupply:
+          type: integer
+          description: ออกได้อีกกี่ใบ
+        status:    { $ref: '#/components/schemas/CouponTypeStatus' }
+        expiresAt: { type: string, format: date-time }
+        chain:
+          oneOf:
+            - $ref: '#/components/schemas/CouponTypeChain'
+            - type: 'null'
+
+    CouponTypeAccepted:
+      type: object
+      required: [couponTypeId, name, faceValue, totalSupply, status, expiresAt, operationId]
+      properties:
+        couponTypeId: { type: string }
+        name:         { type: string }
+        faceValue:    { $ref: '#/components/schemas/BaseUnits' }
+        totalSupply:  { type: integer }
+        status:       { const: "REQUESTED" }
+        expiresAt:    { type: string, format: date-time }
+        operationId:  { type: string }
+
+    IssueRequest:
+      type: object
+      additionalProperties: false
+      required: [quantity]
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: จำนวนรหัสที่ต้องการออก · ต้องไม่เกินโควตาที่เหลือ
+
+    IssuedCode:
+      type: object
+      required: [couponCodeId, code]
+      properties:
+        couponCodeId: { type: string }
+        code:
+          type: string
+          pattern: '^[0-9A-HJ-NP-TV-Z]{4}-[0-9A-HJ-NP-TV-Z]{4}-[0-9A-HJ-NP-TV-Z]{4}$'
+          description: |
+            Crockford base32 · ไม่มี I L O U เพื่อไม่ให้อ่านสับสน
+            **ค่านี้ส่งออกครั้งเดียว** ระบบเก็บแต่ `sha256` ของมัน
+
+    IssueAccepted:
+      type: object
+      required: [batchId, couponTypeId, operationId, quantity, stepCount, codes]
+      properties:
+        batchId:      { type: string }
+        couponTypeId: { type: string }
+        operationId:  { type: string }
+        quantity:     { type: integer }
+        stepCount:
+          type: integer
+          description: จำนวน tx บน chain · ceil(quantity / 500)
+        codes:
+          type: array
+          items: { $ref: '#/components/schemas/IssuedCode' }
+        warning:
+          type: string
+          description: เตือนว่ารหัสจะไม่ถูกส่งอีก
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    OperationStep:
+      type: object
+      required: [index, name, status]
+      properties:
+        index:     { type: integer, minimum: 1 }
+        name:      { type: string, examples: ["createCouponType", "mintCoupon"] }
+        mintCount: { type: integer, minimum: 1, maximum: 500 }
+        status:    { $ref: '#/components/schemas/StepStatus' }
+        txHash:    { type: [string, 'null'] }
+        nonce:     { type: [integer, 'null'], minimum: 0 }
+
+    Operation:
+      type: object
+      required: [operationId, kind, status, createdAt, steps]
+      properties:
+        operationId: { type: string }
+        kind:
+          type: string
+          enum: [COUPON_TYPE_CREATE, COUPON_ISSUE]
+        status:      { $ref: '#/components/schemas/OperationStatus' }
+        createdAt:   { type: string, format: date-time }
+        finalizedAt: { type: [string, 'null'], format: date-time }
+        errorNote:   { type: [string, 'null'] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - IDEMPOTENCY_KEY_REQUIRED
+                - IDEMPOTENCY_KEY_REUSED
+                - IDEMPOTENCY_KEY_IN_PROGRESS
+                - VALIDATION_FAILED
+                - NAME_TAKEN
+                - SUPPLY_EXCEEDED
+                - COUPON_TYPE_NOT_LIVE
+                - COUPON_TYPE_EXPIRED
+                - COUPON_TYPE_NOT_FOUND
+                - MERCHANT_WALLET_NOT_READY
+                - FORBIDDEN
+                - RATE_LIMITED
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

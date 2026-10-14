@@ -1,0 +1,319 @@
+// =====================================================================
+// FEAT-02 · Customer Register + OTP · schema.prisma
+//
+// ไฟล์นี้สะท้อน db/migration.sql · migration เป็นต้นฉบับ ไม่ใช่ไฟล์นี้
+//
+// สิ่งที่หายไปถ้าให้ Prisma generate migration เอง
+//   · event trigger trg_no_secret_columns  ← L6 "ไม่มีวันมี"
+//   · trg_customer_phone_from_challenge    ← F7
+//   · trg_challenge_transition             ← F7 · ห้ามแก้เบอร์หรือ hash
+//   · trg_throttle_check                   ← กันการส่ง SMS รบกวน
+//   · f_verify_otp                         ← นับครั้งใน transaction เดียว
+//   · f_normalize_phone และ CHECK ที่เรียกมัน
+//   · partial unique index uq_challenge_live
+//
+// วิธีใช้
+//   1  psql -d <db> -f db/migration.sql   (ต้องรันด้วยสิทธิ์ที่สร้าง event trigger ได้)
+//   2  npx prisma db pull
+//   3  npx prisma generate
+//   4  ลบโฟลเดอร์ typings/ ทิ้ง
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------ enum
+enum operation_kind {
+  MERCHANT_PROVISION
+  CUSTOMER_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+}
+
+enum operation_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+}
+
+enum step_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+}
+
+enum actor_type {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+}
+
+enum customer_status {
+  PENDING_WALLET
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum wallet_status {
+  REQUESTED
+  LIVE
+  FAILED
+}
+
+enum challenge_status {
+  PENDING
+  VERIFIED
+  CONSUMED
+  EXPIRED
+  LOCKED
+}
+
+enum attempt_result {
+  OK
+  WRONG_CODE
+  EXPIRED
+  LOCKED
+  ALREADY_USED
+}
+
+// ------------------------------------------------------------ ตัวตน
+/// ไม่มีคอลัมน์รหัสผ่านเลย · F12 ใช้ bcrypt(password,10)
+/// ลูกค้าไม่มีรหัสผ่าน · OTP คือการยืนยันตัวตน
+///
+/// phone_e164 มาจาก challenge ที่ VERIFIED แล้วเท่านั้น (F7)
+/// trg_customer_phone_from_challenge บังคับตอน INSERT
+/// trg_customer_phone_immutable ห้ามแก้หลังสร้าง
+model customer {
+  id                String          @id
+  phone_e164        String          @unique(map: "uq_customer_phone")
+  display_name      String?
+  status            customer_status @default(PENDING_WALLET)
+  created_at        DateTime        @default(now()) @db.Timestamptz(6)
+  phone_verified_at DateTime        @db.Timestamptz(6)
+
+  sessions customer_session[]
+
+  @@map("customer")
+}
+
+/// L6 · ไม่มีคอลัมน์ private key และ **ไม่มีวันมี**
+///
+/// F13 · ระบบเดิมเก็บ key ที่เข้ารหัสด้วย AES ไว้ในฐานข้อมูล
+/// F10 · และถอดรหัสเองเพื่อเซ็น
+///
+/// ที่นี่เก็บแค่ kms_key_ref · ระบบไม่เคยเห็น key
+/// การเซ็นเกิดที่ KMS โดยส่ง digest ไปให้เซ็น ไม่ใช่ดึง key ออกมา
+///
+/// event trigger trg_no_secret_columns ปฏิเสธ DDL ที่จะเพิ่มคอลัมน์
+/// ชื่อเข้าข่ายในอนาคต · ทุกตารางในฐานข้อมูล ไม่ใช่แค่ตารางนี้
+model wallet {
+  address     Bytes         @id
+  owner_kind  String
+  owner_id    String
+  kms_key_ref String
+  status      wallet_status @default(REQUESTED)
+  created_at  DateTime      @default(now()) @db.Timestamptz(6)
+  live_at     DateTime?     @db.Timestamptz(6)
+
+  @@unique([owner_kind, owner_id], map: "uq_wallet_owner")
+  @@map("wallet")
+}
+
+// ============================================================ OTP
+/// F6 · ระบบเดิมคืนค่า OTP กลับมาใน response
+///
+/// ตารางนี้ **ไม่มีที่เก็บ OTP** · มีแต่ code_hash
+/// จึงไม่มีอะไรให้คืนกลับไปแม้จะอยากคืน และ dump ฐานข้อมูลก็ไม่ได้ OTP
+///
+/// code_hash = HMAC-SHA256(pepper, challenge_id || ':' || code)
+/// pepper อยู่ใน KMS · ตารางเก็บแค่ pepper_ref
+///
+/// ทำไมไม่ใช้ sha256 เปล่า · OTP หกหลักมีความเป็นไปได้แค่ล้านแบบ
+/// sha256 ของทั้งล้านแบบคำนวณเสร็จในเสี้ยววินาที
+///
+/// attempts นับ "การเดา" ไม่ใช่ "การเรียก"
+/// เรียกตอนล็อกแล้วไม่ใช่การเดา เพราะรหัสไม่ถูกเอามาเทียบเลย
+model otp_challenge {
+  id           String           @id
+  phone_e164   String
+  code_hash    Bytes
+  pepper_ref   String
+  status       challenge_status @default(PENDING)
+  attempts     Int              @default(0)
+  max_attempts Int              @default(5)
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  expires_at   DateTime         @db.Timestamptz(6)
+  verified_at  DateTime?        @db.Timestamptz(6)
+  consumed_at  DateTime?        @db.Timestamptz(6)
+
+  attempts_log otp_attempt[]
+
+  @@map("otp_challenge")
+}
+
+/// Group E (ตาม FEAT-13) · บันทึก **ทุกการเรียก** ไม่ใช่แค่การเดา
+///
+/// คนที่ยิงรัวที่ challenge ที่ล็อกแล้วเป็นข้อมูลด้านความปลอดภัย
+/// ทิ้งไปเงียบๆ แปลว่ามีคนลองแล้วไม่มีใครรู้
+///
+/// ไม่เก็บรหัสที่ใส่ผิดเข้ามา · เก็บแต่ว่าผิด
+/// เพราะคนมักพิมพ์รหัสของที่อื่นผิดมาลงที่นี่
+model otp_attempt {
+  id           String         @id
+  challenge_id String
+  attempt_no   Int
+  result       attempt_result
+  ip_hash      Bytes?
+  created_at   DateTime       @default(now()) @db.Timestamptz(6)
+
+  challenge otp_challenge @relation(fields: [challenge_id], references: [id], onDelete: Cascade)
+
+  @@unique([challenge_id, attempt_no], map: "uq_attempt_no")
+  @@map("otp_attempt")
+}
+
+/// จำกัดการขอ OTP ต่อเบอร์
+/// ไม่มีข้อนี้ ใครก็ส่ง SMS ไปรบกวนเบอร์คนอื่นได้ฟรีเท่าที่อยาก
+/// และค่า SMS เป็นของเรา
+model phone_throttle {
+  phone_e164   String    @id
+  window_start DateTime  @default(now()) @db.Timestamptz(6)
+  sent_count   Int       @default(0)
+  last_sent_at DateTime? @db.Timestamptz(6)
+  locked_until DateTime? @db.Timestamptz(6)
+
+  @@map("phone_throttle")
+}
+
+/// F12 · ระบบเดิมคืน 201 ไม่มี token · ลูกค้าต้องไป login อีกรอบ
+/// ที่นี่ยืนยัน OTP สำเร็จแล้วได้ session ทันที
+///
+/// เก็บแต่ token_hash · ตารางนี้ไม่มีที่เก็บ token
+/// เหมือนที่ otp_challenge ไม่มีที่เก็บ OTP
+model customer_session {
+  id          String    @id
+  customer_id String
+  token_hash  Bytes     @unique(map: "uq_session_token")
+  created_at  DateTime  @default(now()) @db.Timestamptz(6)
+  expires_at  DateTime  @db.Timestamptz(6)
+  revoked_at  DateTime? @db.Timestamptz(6)
+
+  customer customer @relation(fields: [customer_id], references: [id])
+
+  @@map("customer_session")
+}
+
+// -------------------------------------------- Group B · แกน write path
+model idempotency_key {
+  id              String   @id
+  scope           String
+  key             String
+  fingerprint     Bytes
+  operation_id    String?
+  response_status Int?
+  response_body   Json?
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  expires_at      DateTime @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+model operation {
+  id           String           @id
+  actor_scope  String
+  kind         operation_kind
+  status       operation_status @default(PENDING)
+  subject_id   String?
+  payload      Json
+  error_note   String?
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  finalized_at DateTime?        @db.Timestamptz(6)
+
+  steps     operation_step[]
+  outbox    outbox[]
+  events    operation_event[]
+  idem_keys idempotency_key[]
+
+  @@map("operation")
+}
+
+model signer {
+  address    Bytes   @id
+  key_ref    String
+  next_nonce BigInt  @default(0)
+  enabled    Boolean @default(true)
+
+  steps operation_step[]
+
+  @@map("signer")
+}
+
+model operation_step {
+  id             String      @id
+  operation_id   String
+  step_index     Int
+  name           String
+  signer_address Bytes?
+  nonce          BigInt?
+  raw_tx         Bytes?
+  tx_hash        Bytes?
+  status         step_status @default(PENDING)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+  signer    signer?   @relation(fields: [signer_address], references: [address])
+
+  @@unique([operation_id, step_index], map: "uq_step_order")
+  @@map("operation_step")
+}
+
+model outbox {
+  id           String    @id
+  operation_id String
+  topic        String
+  payload      Json
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  sent_at      DateTime? @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("outbox")
+}
+
+model operation_event {
+  id           String            @id
+  operation_id String
+  from_status  operation_status?
+  to_status    operation_status
+  actor        actor_type        @default(SYSTEM)
+  metadata     Json              @default("{}")
+  created_at   DateTime          @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("operation_event")
+}

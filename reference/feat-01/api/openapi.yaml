@@ -1,0 +1,418 @@
+openapi: 3.1.0
+info:
+  title: FEAT-01 · Merchant Onboarding
+  version: 1.0.0-draft
+  summary: สมัครร้านค้า · ร้านมีตัวตนทันที · wallet บน chain ตามมาทีหลัง
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 8 และ RFD 4
+
+    **ทำไมคืน `201` ไม่ใช่ `202`** (RFD 8 §3.4)
+
+    ไล่ดูทีละอย่างว่าตอนสมัครมีอะไรต้องทำบน chain จริงบ้าง
+
+    | ขั้นตอน | เป็น tx บน chain ไหม |
+    |---|---|
+    | สร้าง key ที่ KMS | ไม่ · เป็น API call ธรรมดา |
+    | คำนวณ address จาก public key | ไม่ · คำนวณได้ทันที |
+    | whitelist ร้านใน contract | ใช่ |
+    | `setApprovalForAll` ให้ marketplace | ใช่ |
+
+    สองอย่างแรกจบใน request ได้ · สองอย่างหลังไม่จำเป็นต้องเสร็จก่อนร้านมีตัวตน
+    จึง **คืน `201` พร้อม `merchantId` และ `wallet.address` ทันที**
+    แล้วแยกงาน provision ออกเป็น `operation` ที่ commit พร้อมกันใน transaction เดียว
+
+    เพื่อให้ `201` ไม่เป็นคำโกหก มีเงื่อนไขสองข้อ
+
+    1. `merchant.status` เป็น `PENDING` · `ACTIVE` เขียนได้จาก projector เท่านั้น
+    2. endpoint ที่ต้องใช้ความสามารถบน chain จะตอบ `422 MERCHANT_WALLET_NOT_READY`
+       จนกว่า provision จะ `FINALIZED`
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Merchant
+    description: ร้านค้าและแอดมินของร้าน
+  - name: Operation
+    description: ติดตามงาน async
+
+paths:
+  /v1/merchants:
+    post:
+      tags: [Merchant]
+      operationId: createMerchant
+      summary: สมัครร้านค้า
+      description: |
+        endpoint นี้ **ไม่ต้องมี token** เพราะยังไม่มีใครล็อกอิน
+
+        `scope` ของ Idempotency-Key จึงเป็น `anon:<sha256(normalized email)>`
+        ไม่ใช่ `merchant:<id>` เพราะยังไม่มี actor ให้อ้างถึง (RFD 3 D1)
+
+        **ลำดับที่ห้ามสลับ**
+
+        ```text
+        1  validate DTO
+        2  normalize email · NFC → trim → lowercase
+        3  fingerprint = sha256(canonical DTO)
+        4  argon2id hash password
+        5  เรียก KMS createKey        ← ก่อนเปิด transaction (RFD 4 D3)
+        6  BEGIN ... COMMIT           ← ทุกแถวหรือไม่มีเลย
+        7  ตอบ 201
+        ```
+
+        ข้อ 5 อยู่นอก transaction เพราะ KMS เป็น external call
+        ถือ DB transaction ค้างระหว่างรอ network คือ outage ที่รอเวลาเกิด
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMerchantRequest'
+            examples:
+              ปกติ:
+                value:
+                  name: "ร้านกาแฟสุขใจ"
+                  admin:
+                    email: "owner@shop.co.th"
+                    password: "correct-horse-battery-staple"
+                    displayName: "สมชาย ใจดี"
+      responses:
+        '201':
+          description: ร้านถูกสร้างแล้ว · provision บน chain กำลังตามมา
+          headers:
+            Location:
+              schema: { type: string }
+              example: /v1/merchants/mch_8f2a41
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMerchantResponse'
+              examples:
+                ปกติ:
+                  value:
+                    merchantId: "mch_8f2a41"
+                    name: "ร้านกาแฟสุขใจ"
+                    status: "PENDING"
+                    createdAt: "2026-10-01T08:12:44Z"
+                    admin:
+                      adminId: "adm_19bd"
+                      email: "owner@shop.co.th"
+                    wallet:
+                      address: "0x1111111111111111111111111111111111111111"
+                    provisioning:
+                      operationId: "op_8f2a41"
+                      status: "PENDING"
+        '400':
+          description: |
+            header `Idempotency-Key` หาย หรือ body ผิดรูป
+
+            **server ไม่สร้าง key ให้เอง** เพราะถ้าสร้างให้ การ retry ของ client
+            จะได้ key คนละตัวทุกครั้ง ซึ่งแปลว่าไม่มี idempotency เลย (RFD 3 D6)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ไม่มี Idempotency-Key:
+                  value:
+                    error:
+                      code: "IDEMPOTENCY_KEY_REQUIRED"
+                      message: "ต้องส่ง header Idempotency-Key"
+                      requestId: "req_01J9X"
+                password สั้นเกิน:
+                  value:
+                    error:
+                      code: "VALIDATION_FAILED"
+                      message: "password ต้องยาวอย่างน้อย 12 ตัวอักษร"
+                      requestId: "req_01J9Y"
+                      details:
+                        field: "admin.password"
+        '409':
+          description: |
+            | code | หมายถึง | retry ได้ไหม |
+            |---|---|---|
+            | `EMAIL_TAKEN` | อีเมลนี้สมัครไปแล้ว | ไม่ได้ |
+            | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body ต่าง | ไม่ได้ |
+            | `IDEMPOTENCY_KEY_IN_PROGRESS` | คำขอก่อนหน้ายังไม่จบ | ได้ |
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              example: 1
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                อีเมลซ้ำ:
+                  value:
+                    error:
+                      code: "EMAIL_TAKEN"
+                      message: "อีเมลนี้ถูกใช้สมัครไปแล้ว"
+                      requestId: "req_01J9Z"
+        '429':
+          description: เกิน rate limit ต่อ IP
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/merchants/{merchantId}:
+    get:
+      tags: [Merchant]
+      operationId: getMerchant
+      summary: ดูข้อมูลร้าน
+      description: |
+        `status = ACTIVE` แปลว่า provision บน chain เสร็จและ final แล้ว
+        ก่อนหน้านั้นเป็น `PENDING` และเรียก endpoint ที่ต้องใช้ chain ยังไม่ได้
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: merchantId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^mch_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: ข้อมูลร้าน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+              examples:
+                รอ provision:
+                  value:
+                    merchantId: "mch_8f2a41"
+                    name: "ร้านกาแฟสุขใจ"
+                    status: "PENDING"
+                    createdAt: "2026-10-01T08:12:44Z"
+                    activatedAt: null
+                    wallet:
+                      address: "0x1111111111111111111111111111111111111111"
+                      ready: false
+                พร้อมใช้งาน:
+                  value:
+                    merchantId: "mch_8f2a41"
+                    name: "ร้านกาแฟสุขใจ"
+                    status: "ACTIVE"
+                    createdAt: "2026-10-01T08:12:44Z"
+                    activatedAt: "2026-10-01T08:14:02Z"
+                    wallet:
+                      address: "0x1111111111111111111111111111111111111111"
+                      ready: true
+        '403':
+          description: ไม่ใช่ร้านของผู้เรียก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: ไม่พบร้าน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [Operation]
+      operationId: getOperation
+      summary: ดูสถานะงาน provision
+      description: |
+        **เฉพาะ `FINALIZED` เท่านั้นที่แสดงต่อผู้ใช้ได้ว่า "สำเร็จ"**
+        `CONFIRMED` ยังย้อนได้ถ้าเกิด reorg (RFD 2 D9)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: สถานะปัจจุบัน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+              examples:
+                กำลังทำ:
+                  value:
+                    operationId: "op_8f2a41"
+                    kind: "MERCHANT_PROVISION"
+                    status: "SUBMITTED"
+                    createdAt: "2026-10-01T08:12:44Z"
+                    finalizedAt: null
+                    steps:
+                      - index: 1
+                        name: "whitelistMerchant"
+                        status: "FINALIZED"
+                        txHash: "0xaa...01"
+                        nonce: 41
+                      - index: 2
+                        name: "setApprovalForAll"
+                        status: "SUBMITTED"
+                        txHash: "0xbb...02"
+                        nonce: 42
+        '404':
+          description: ไม่พบงาน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        UUID v4 ที่ client สร้างเอง · ส่งค่าเดิมเมื่อ retry
+        เก็บไว้ 72 ชั่วโมง · ส่งซ้ำภายในช่วงนั้นได้ response เดิมกลับไป
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 255
+      example: "11111111-2222-3333-4444-555555555555"
+
+  schemas:
+    AdminInput:
+      type: object
+      additionalProperties: false
+      required: [email, password, displayName]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: normalize ด้วย NFC → trim → lowercase ก่อนเก็บและก่อน hash
+        password:
+          type: string
+          minLength: 12
+          maxLength: 256
+          description: |
+            hash ด้วย **argon2id** ไม่ใช่ bcrypt (RFD 8 D7)
+            bcrypt ตัดที่ 72 ไบต์เงียบๆ ซึ่งอันตรายกับ passphrase ภาษาไทย
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 120
+
+    CreateMerchantRequest:
+      type: object
+      additionalProperties: false
+      required: [name, admin]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        admin:
+          $ref: '#/components/schemas/AdminInput'
+
+    WalletView:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{40}$'
+          description: address คำนวณจาก public key · private key อยู่ใน KMS เท่านั้น
+        ready:
+          type: boolean
+          description: true เมื่อ provision บน chain `FINALIZED` แล้ว
+
+    CreateMerchantResponse:
+      type: object
+      required: [merchantId, name, status, createdAt, admin, wallet, provisioning]
+      properties:
+        merchantId: { type: string, examples: ["mch_8f2a41"] }
+        name:       { type: string }
+        status:     { const: "PENDING" }
+        createdAt:  { type: string, format: date-time }
+        admin:
+          type: object
+          required: [adminId, email]
+          properties:
+            adminId: { type: string }
+            email:   { type: string, format: email }
+        wallet: { $ref: '#/components/schemas/WalletView' }
+        provisioning:
+          type: object
+          description: งานที่จะทำให้ร้านใช้งานบน chain ได้ · ติดตามด้วย operationId
+          required: [operationId, status]
+          properties:
+            operationId: { type: string }
+            status:      { const: "PENDING" }
+
+    Merchant:
+      type: object
+      required: [merchantId, name, status, createdAt]
+      properties:
+        merchantId:  { type: string }
+        name:        { type: string }
+        status:      { $ref: '#/components/schemas/MerchantStatus' }
+        createdAt:   { type: string, format: date-time }
+        activatedAt: { type: [string, 'null'], format: date-time }
+        wallet:      { $ref: '#/components/schemas/WalletView' }
+
+    MerchantStatus:
+      type: string
+      enum: [PENDING, ACTIVE, SUSPENDED, CLOSED]
+      description: |
+        | status | ร้านทำอะไรได้ |
+        |---|---|
+        | `PENDING` | ล็อกอินได้ · แก้โปรไฟล์ได้ · ยังออก point/coupon ไม่ได้ |
+        | `ACTIVE` | ได้ทุกอย่าง |
+        | `SUSPENDED` | อ่านได้อย่างเดียว |
+        | `CLOSED` | เข้าไม่ได้ |
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    OperationStep:
+      type: object
+      required: [index, name, status]
+      properties:
+        index:  { type: integer, minimum: 1 }
+        name:   { type: string, examples: ["whitelistMerchant", "setApprovalForAll"] }
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash: { type: [string, 'null'] }
+        nonce:  { type: [integer, 'null'], minimum: 0 }
+
+    Operation:
+      type: object
+      required: [operationId, kind, status, createdAt, steps]
+      properties:
+        operationId: { type: string }
+        kind:        { const: "MERCHANT_PROVISION" }
+        status:      { $ref: '#/components/schemas/OperationStatus' }
+        createdAt:   { type: string, format: date-time }
+        finalizedAt: { type: [string, 'null'], format: date-time }
+        errorNote:   { type: [string, 'null'] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:      { type: string }
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

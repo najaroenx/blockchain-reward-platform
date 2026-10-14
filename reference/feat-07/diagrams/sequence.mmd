@@ -1,0 +1,75 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant A as api
+    participant D as PostgreSQL
+    participant W as worker
+    participant N as chain
+    participant P as projector
+
+    rect rgb(248,249,250)
+    Note over C,D: สร้างประเภทคูปอง
+    C->>+A: POST /v1/coupon-types · { name, faceValue, totalSupply, expiresAt }
+    A->>+D: BEGIN
+    A->>D: INSERT idempotency_key ON CONFLICT DO NOTHING
+    A->>D: INSERT coupon_type · status REQUESTED
+    Note right of D: trigger เช็คว่าร้าน ACTIVE<br/>uq_coupon_type_name ชนแล้ว 409
+    A->>D: INSERT operation COUPON_TYPE_CREATE + step + outbox
+    D-->>-A: COMMIT
+    A-->>-C: 202 { couponTypeId, status REQUESTED }
+    end
+
+    W->>+N: factory.createCouponType(faceValue, totalSupply, expiresAt)
+    N-->>-W: tx_hash
+    P->>D: INSERT coupon_type_chain · UPDATE coupon_type → LIVE
+
+    rect rgb(248,249,250)
+    Note over C,D: ออกรหัสเป็นชุด · plaintext ออกจากระบบครั้งเดียว
+    C->>+A: POST /v1/coupon-types/id/codes · { quantity: 3 }
+    A->>+D: BEGIN
+    A->>D: INSERT idempotency_key
+    A->>D: SELECT coupon_type · ต้อง LIVE และยังไม่หมดอายุ
+    A->>D: INSERT operation COUPON_ISSUE + issue_batch
+    A->>D: INSERT operation_step ตามจำนวน · step ละไม่เกิน 500 ใบ
+    loop ทีละใบ
+        A->>A: plaintext = generateCode() จาก CSPRNG
+        A->>A: code_hash = sha256(plaintext)
+        A->>A: code_ref = sha256(id) · ไม่ใช่ของ plaintext
+        A->>D: INSERT coupon_code (code_hash, code_ref)
+        Note right of D: trigger ตรวจว่า code_ref = sha256(id)<br/>และตรวจโควตาใต้ advisory lock
+    end
+    A->>D: INSERT outbox · payload ไม่มีรหัส
+    A->>D: UPDATE idempotency_key · response_body ไม่มีรหัส
+    D-->>-A: COMMIT
+    A-->>-C: 202 { codes[] } + คำเตือนว่าจะไม่ส่งอีก
+    Note right of A: plaintext อยู่ในหน่วยความจำ<br/>ของ request นี้เท่านั้น
+    end
+
+    Note over W,N: mint บน chain · ใช้ code_ref ที่คำนวณจาก id ได้เอง
+    W->>+D: claim outbox FOR UPDATE SKIP LOCKED
+    D-->>-W: operation + batch
+    W->>D: SELECT coupon_code.id ของ batch นี้
+    W->>W: code_ref = sha256(id) · ไม่ต้องรู้ plaintext
+    W->>D: UPDATE step SET raw_tx nonce · COMMIT ก่อน broadcast
+    W->>+N: mintCoupon(chainTypeId, code_ref[])
+    N-->>-W: tx_hash
+
+    Note over P,D: PROJECT
+    P->>+D: chain_event WHERE applied_at IS NULL
+    D-->>-P: CouponMinted · code_ref
+    P->>D: จับคู่ code_ref กลับไปหา coupon_code
+    Note right of P: จับคู่ได้เพราะ code_ref มาจาก id<br/>ถ้ามาจาก plaintext จะจับคู่ไม่ได้เลย
+    P->>D: operation → FINALIZED
+
+    Note over C,A: ลูกค้ายื่นรหัสมาใช้
+    C->>+A: ยื่น plaintext
+    A->>D: SELECT coupon_code WHERE code_hash = sha256(plaintext)
+    A-->>-C: เจอใบไหน สถานะอะไร

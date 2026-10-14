@@ -1,0 +1,38 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> PENDING : ขอ OTP · ส่ง SMS
+
+    note right of PENDING
+        ฐานข้อมูลเก็บแต่ code_hash
+        ไม่มีที่เก็บ OTP เอง
+        ขอใหม่ = อันนี้ EXPIRED ทันที
+    end note
+
+    PENDING --> VERIFIED : รหัสถูก
+    PENDING --> LOCKED : ผิดครบ 5 ครั้ง
+    PENDING --> EXPIRED : หมดเวลา หรือขอใหม่
+
+    VERIFIED --> CONSUMED : ใช้สมัครหรือเข้าสู่ระบบแล้ว
+    VERIFIED --> EXPIRED : หมดเวลาก่อนใช้
+
+    note right of VERIFIED
+        สถานะเดียวที่ใช้สมัครได้
+        trg_customer_phone_from_challenge
+        บังคับว่าเบอร์ต้องตรงกับที่นี่
+    end note
+
+    note left of LOCKED
+        เบอร์ถูกล็อก 30 นาทีด้วย
+        ยิงรัวต่อยังถูกบันทึก
+        แต่ไม่นับเป็นการเดา
+    end note
+
+    note left of CONSUMED
+        ใช้ได้ครั้งเดียว
+        ปลายทาง ออกไปไหนไม่ได้
+    end note
+
+    LOCKED --> [*]
+    EXPIRED --> [*]
+    CONSUMED --> [*]

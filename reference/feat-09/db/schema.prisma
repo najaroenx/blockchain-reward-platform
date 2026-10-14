@@ -1,0 +1,367 @@
+// =====================================================================
+// FEAT-09 · Delist · schema.prisma
+//
+// ไฟล์นี้สะท้อน db/migration.sql · migration เป็นต้นฉบับ ไม่ใช่ไฟล์นี้
+// เหตุผล · trigger partial unique index และข้อความ error ภาษาไทย
+// เขียนใน Prisma schema ไม่ได้ · ถ้าให้ Prisma generate migration เอง
+// กฎที่สำคัญที่สุดของ feature นี้จะหายไปทั้งหมด
+//
+// วิธีใช้
+//   1  psql -d <db> -f db/migration.sql
+//   2  npx prisma db pull   (ตรวจว่าตรงกัน)
+//   3  npx prisma generate
+//   4  ลบโฟลเดอร์ typings/ ทิ้ง
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------ enum
+enum operation_kind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+}
+
+enum operation_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+}
+
+enum step_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+}
+
+enum merchant_status {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum coupon_type_status {
+  REQUESTED
+  LIVE
+  FAILED
+  RETIRED
+}
+
+enum coupon_code_state {
+  ISSUED
+  HELD
+  REDEEMED
+  EXPIRED
+  VOIDED
+}
+
+enum holder_kind {
+  MERCHANT
+  CUSTOMER
+}
+
+enum actor_type {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+}
+
+enum reservation_subject {
+  POINT_BALANCE
+  COUPON_UNIT
+  LISTING
+  THB_BALANCE
+  ESCROW
+}
+
+enum listing_status {
+  PENDING
+  ACTIVE
+  SOLD
+  DELISTED
+  FAILED
+}
+
+/// เหตุผลที่รายการบน chain ปิด · ตั้งแล้วเปลี่ยนไม่ได้
+enum listing_close_reason {
+  CANCELLED
+  SOLD
+}
+
+// ------------------------------------------------------------ ตัวตน
+model merchant {
+  id         String          @id
+  name       String
+  status     merchant_status @default(PENDING)
+  created_at DateTime        @default(now()) @db.Timestamptz(6)
+
+  coupon_types coupon_type[]
+
+  @@map("merchant")
+}
+
+model customer {
+  id         String   @id
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("customer")
+}
+
+model signer {
+  address    Bytes   @id
+  key_ref    String
+  next_nonce BigInt  @default(0)
+  enabled    Boolean @default(true)
+
+  steps operation_step[]
+
+  @@map("signer")
+}
+
+model coupon_type {
+  id           String             @id
+  merchant_id  String
+  name         String
+  face_value   Decimal            @db.Decimal(78, 0)
+  total_supply Int
+  status       coupon_type_status @default(REQUESTED)
+  expires_at   DateTime           @db.Timestamptz(6)
+
+  merchant merchant      @relation(fields: [merchant_id], references: [id])
+  codes    coupon_code[]
+  listings listing[]
+
+  @@map("coupon_type")
+}
+
+model coupon_code {
+  id             String            @id
+  coupon_type_id String
+  code_hash      Bytes
+  code_ref       Bytes
+  state          coupon_code_state @default(ISSUED)
+  holder_kind    holder_kind?
+  holder_id      String?
+
+  coupon_type coupon_type    @relation(fields: [coupon_type_id], references: [id])
+  items       listing_item[]
+
+  @@unique([code_hash], map: "uq_code_hash")
+  @@unique([code_ref], map: "uq_code_ref")
+  @@map("coupon_code")
+}
+
+// ------------------------------------------------------- รายการขาย
+/// active_at ต้องมีค่าเมื่อสถานะเป็น ACTIVE SOLD หรือ DELISTED
+/// closed_at ต้องมีค่าเมื่อสถานะเป็น SOLD หรือ DELISTED
+/// trg_listing_status_transition เติมสองช่องนี้ให้เอง และกันการย้อนสถานะ
+model listing {
+  id             String         @id
+  seller_kind    holder_kind
+  seller_id      String
+  coupon_type_id String
+  unit_price     Decimal        @db.Decimal(78, 0)
+  quantity       Int
+  status         listing_status @default(PENDING)
+  created_at     DateTime       @default(now()) @db.Timestamptz(6)
+  active_at      DateTime?      @db.Timestamptz(6)
+  closed_at      DateTime?      @db.Timestamptz(6)
+
+  coupon_type coupon_type    @relation(fields: [coupon_type_id], references: [id])
+  items       listing_item[]
+  chain       listing_chain?
+
+  @@index([seller_kind, seller_id, status], map: "ix_listing_seller")
+  @@map("listing")
+}
+
+model listing_item {
+  id             String @id
+  listing_id     String
+  coupon_code_id String
+
+  listing     listing     @relation(fields: [listing_id], references: [id], onDelete: Cascade)
+  coupon_code coupon_code @relation(fields: [coupon_code_id], references: [id])
+
+  @@unique([listing_id, coupon_code_id], map: "uq_item_in_listing")
+  @@index([coupon_code_id], map: "ix_item_code")
+  @@map("listing_item")
+}
+
+/// projection แท้ (RFD 6 §3.2) · indexer เขียน api ไม่เขียน
+/// closed_* และ close_reason ถูกเขียนเมื่อเห็น event ไม่ใช่เมื่อรับคำขอ
+model listing_chain {
+  listing_id       String                @id
+  contract_address Bytes
+  chain_listing_id Decimal               @db.Decimal(78, 0)
+  created_block    BigInt
+  created_tx_hash  Bytes
+  closed_block     BigInt?
+  closed_tx_hash   Bytes?
+  close_reason     listing_close_reason?
+  applied_at       DateTime              @default(now()) @db.Timestamptz(6)
+
+  listing listing @relation(fields: [listing_id], references: [id])
+
+  @@unique([contract_address, chain_listing_id], map: "uq_listing_chain")
+  @@map("listing_chain")
+}
+
+// -------------------------------------------- Group B · แกน write path
+model idempotency_key {
+  id              String    @id
+  scope           String
+  key             String
+  fingerprint     Bytes
+  operation_id    String?
+  response_status Int?
+  response_body   Json?
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  expires_at      DateTime  @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+/// actor_scope มาจาก token ที่ผ่าน auth แล้ว ไม่ใช่จาก body
+/// trg_delist_admissible อ่านช่องนี้เพื่อตรวจเจ้าของรายการขาย (F5)
+model operation {
+  id           String           @id
+  actor_scope  String
+  kind         operation_kind
+  status       operation_status @default(PENDING)
+  subject_id   String?
+  payload      Json
+  error_note   String?
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  finalized_at DateTime?        @db.Timestamptz(6)
+
+  steps        operation_step[]
+  outbox       outbox[]
+  reservations reservation[]
+  events       operation_event[]
+  idem_keys    idempotency_key[]
+  chain_events chain_event[]
+
+  @@map("operation")
+}
+
+model operation_step {
+  id             String      @id
+  operation_id   String
+  step_index     Int
+  name           String
+  signer_address Bytes?
+  nonce          BigInt?
+  raw_tx         Bytes?
+  tx_hash        Bytes?
+  status         step_status @default(PENDING)
+  submitted_at   DateTime?   @db.Timestamptz(6)
+  confirmed_at   DateTime?   @db.Timestamptz(6)
+  finalized_at   DateTime?   @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+  signer    signer?   @relation(fields: [signer_address], references: [address])
+
+  @@unique([operation_id, step_index], map: "uq_step_order")
+  @@unique([operation_id, name], map: "uq_step_name")
+  @@map("operation_step")
+}
+
+model outbox {
+  id           String    @id
+  operation_id String
+  topic        String
+  payload      Json
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  sent_at      DateTime? @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("outbox")
+}
+
+/// uq_reservation_exclusive · partial unique index เขียนที่นี่ไม่ได้
+///   UNIQUE (subject_type, subject_id)
+///   WHERE released_at IS NULL AND subject_type IN ('COUPON_UNIT','LISTING','ESCROW')
+///
+/// ปล่อยจองมีสองชั้นคุม
+///   trg_reservation_release_timing  งานต้อง FINALIZED หรือ CHAIN_REVERTED
+///   trg_coupon_hold_until_closed    รายการขายต้องปิดแล้ว
+model reservation {
+  id           String              @id
+  operation_id String
+  subject_type reservation_subject
+  subject_id   String
+  amount       Decimal             @db.Decimal(78, 0)
+  created_at   DateTime            @default(now()) @db.Timestamptz(6)
+  released_at  DateTime?           @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@index([operation_id], map: "ix_reservation_by_op")
+  @@map("reservation")
+}
+
+model operation_event {
+  id           String           @id
+  operation_id String
+  from_status  operation_status?
+  to_status    operation_status
+  actor        actor_type       @default(SYSTEM)
+  tx_hash      Bytes?
+  metadata     Json             @default("{}")
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@index([operation_id, created_at], map: "ix_opevent_by_op")
+  @@map("operation_event")
+}
+
+// --------------------------------------------- Group C · ฝั่งอ่าน chain
+model chain_event {
+  id              String    @id
+  block_number    BigInt
+  block_hash      Bytes
+  tx_hash         Bytes
+  log_index       Int
+  address         Bytes
+  topic0          Bytes
+  topics          Json      @default("[]")
+  data            Bytes
+  block_timestamp DateTime  @db.Timestamptz(6)
+  operation_id    String?
+  orphaned_at     DateTime? @db.Timestamptz(6)
+  applied_at      DateTime? @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([tx_hash, log_index], map: "uq_chain_event")
+  @@map("chain_event")
+}

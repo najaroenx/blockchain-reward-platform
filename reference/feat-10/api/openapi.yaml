@@ -1,0 +1,430 @@
+openapi: 3.1.0
+info:
+  title: FEAT-10 · Buy Coupon
+  version: 1.0.0
+  description: |
+    ลูกค้าซื้อคูปองจาก marketplace · เงินเปลี่ยนมือจริง
+
+    ## สองช่องของระบบเดิมที่ feature นี้ปิด
+
+    ทั้งสองอยู่ตรงข้ามกันพอดี — ข้างหนึ่งเงินไม่ไปถึง อีกข้างเงินงอกขึ้นมาเอง
+
+    `F8` — `Vault.json` มี `lockFunds` `releaseFundsPartial` `returnFunds` ครบ
+    แต่ grep ทั้ง repo **ไม่เจอผู้เรียกเลย** เงินจึงไม่เคยถึงผู้ขาย
+    ที่นี่ทุกการเคลื่อนเงินเป็นแถวใน `ledger_entry` ที่ต้องรวมได้ศูนย์
+    ต่อหนึ่ง `operation` และยอดคงเหลือทุกบัญชีต้องเท่ากับผลรวม ledger
+    ของบัญชีนั้น · ตรวจตอน `COMMIT` ด้วย constraint trigger ที่ deferred
+    เงินหายไปเงียบๆ จึงเป็นไปไม่ได้
+
+    `F4` — `autoMintIfNeeded` เสก THB ขึ้นมาด้วย admin key เมื่อยอดไม่พอ
+    ที่นี่ยอดไม่พอคือ `409 INSUFFICIENT_THB` และไม่มีทางอื่น
+    ยอดคงเหลือไม่มี setter — จะเพิ่มยอดต้องเขียน ledger คู่กัน ไม่งั้นไม่ commit
+
+    ## สองขั้น · ขั้นที่สองเป็น tx เดียวโดยตั้งใจ
+
+    | ขั้น | tx | ทำอะไร |
+    |---|---|---|
+    | 1 | `approveTHB` | ให้ marketplace ใช้ THB ได้เท่า `totalPrice` พอดี |
+    | 2 | `executePurchase` | ย้ายทั้งเงินและคูปองใน tx เดียว |
+
+    ถ้าแยกเงินกับของเป็นสอง tx จะเกิดสถานะ "จ่ายแล้วแต่ไม่ได้ของ"
+    ที่ต้องเขียนทางกู้คืน และทางกู้คืนนั้นคือที่ที่ `F8` ตายไป —
+    มีฟังก์ชันครบแต่ไม่มีใครเรียก · atomic บน chain จึงถูกกว่าทุกทาง
+
+    ## ค่าธรรมเนียม
+
+    อัตราอยู่ในตาราง `fee_schedule` ที่มี `effective_from`
+    `purchase.fee_bps` บันทึกอัตราที่ใช้จริง · เปลี่ยนอัตราวันนี้
+    ไม่ทำให้ยอดของการซื้อเมื่อวานเปลี่ยนตาม
+
+    ปัดลงเสมอ และ **เศษที่ปัดตกเป็นของผู้ขาย ไม่ใช่ของ platform**
+    `feeAmount + netToSeller` ต้องเท่ากับ `totalPrice` พอดี
+    ฐานข้อมูลตรวจทั้งสามทาง — ยอดรวม · สูตร fee · และผลคูณราคา
+
+    ## หน่วยเงิน
+
+    `RFD 14 L3` — base units `numeric(78,0)` ส่งบน wire เป็น **string** เสมอ
+    ราคา 80 THB คูณ 500 ใบ เกิน 2^53 ไปไกล · JSON number ใช้ไม่ได้
+
+servers:
+  - url: https://api.example.com
+    description: production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: marketplace
+    description: ดูและซื้อรายการขาย
+  - name: operations
+    description: ติดตามงานที่ส่งไป chain
+
+paths:
+  /v1/listings:
+    get:
+      tags: [marketplace]
+      summary: รายการที่ขายอยู่
+      operationId: browseListings
+      parameters:
+        - name: couponTypeId
+          in: query
+          schema: { type: string, pattern: '^ct_[A-Za-z0-9]{6,}$' }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ListingView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/listings/{listingId}/purchase:
+    post:
+      tags: [marketplace]
+      summary: ซื้อรายการขายทั้งใบ
+      operationId: buyListing
+      description: |
+        ซื้อทั้งใบเท่านั้น · ซื้อบางส่วนของรายการไม่ได้
+        ผู้ขายเป็นคนกำหนดว่าจะรวมกี่ใบในหนึ่งรายการ (FEAT-08)
+        ถ้าต้องการขายแยกใบ ผู้ขายลงหลายรายการ
+
+        ผู้เรียกต้องส่ง `expectedTotalPrice` มาด้วย — ยอดที่หน้าจอแสดงไว้
+        ถ้าไม่ตรงกับยอดที่ server คำนวณได้ จะได้ `409 PRICE_MISMATCH`
+        ราคารายการแก้ไม่ได้หลังขึ้นขาย (`trg_listing_price_immutable`)
+        ช่องนี้จึงจับกรณีที่หน้าจอถือข้อมูลเก่าหรือค่าธรรมเนียมเปลี่ยน
+
+        ### เงินถูกกันไว้ ไม่ได้ย้าย
+
+        ตอนรับคำขอ ระบบสร้าง `reservation` ของ `THB_BALANCE` เท่ายอดที่ต้องจ่าย
+        เงินยังอยู่ในบัญชีผู้ซื้อ · ยอดที่ใช้ได้ลดลงเท่านั้น
+        ถ้า tx revert ก็แค่ปล่อยการจอง ไม่ต้องย้ายเงินกลับ
+
+        THB เป็นของบวกกันได้ จึงใช้ advisory lock ต่อบัญชีแล้วคำนวณ
+        ยอดที่ใช้ได้ ไม่ใช่ partial unique index เหมือนคูปอง
+      parameters:
+        - $ref: '#/components/parameters/ListingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BuyRequest' }
+      responses:
+        '202':
+          description: รับงานแล้ว · เงินถูกกันไว้ ยังไม่ย้าย
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchaseAccepted' }
+        '200':
+          description: คำขอเดิมด้วย key เดิม · คืนคำตอบที่บันทึกไว้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchaseAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/purchases/{purchaseId}:
+    get:
+      tags: [marketplace]
+      summary: รายละเอียดการซื้อหนึ่งครั้ง
+      operationId: getPurchase
+      description: |
+        ผู้ซื้อและผู้ขายเห็นแถวนี้ได้ · คนอื่นได้ `404`
+        `feeAmount` แสดงให้ทั้งสองฝ่ายเห็น — ผู้ขายควรรู้ว่าถูกหักเท่าไร
+      parameters:
+        - name: purchaseId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^pur_[A-Za-z0-9]{6,}$' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchaseView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/balance:
+    get:
+      tags: [marketplace]
+      summary: ยอด THB ของผู้เรียก
+      operationId: getBalance
+      description: |
+        `amount` คือยอดคงเหลือ · `reserved` คือส่วนที่ถูกกันไว้กับคำขอที่ค้าง
+        `available` = `amount` − `reserved` คือยอดที่ซื้อของได้จริง
+
+        ยอดนี้เป็น projection ของ `ledger_entry` · ไม่ใช่ค่าที่ตั้งเองได้
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [operations]
+      summary: สถานะงานและขั้นของมัน
+      operationId: getOperation
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[A-Za-z0-9]{6,}$' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ListingId:
+      name: listingId
+      in: path
+      required: true
+      schema: { type: string, pattern: '^lst_[A-Za-z0-9]{6,}$' }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        `SPEC-001` · UUID v4 · เก็บไว้ 72 ชั่วโมง
+
+        `[IK-23]` — fingerprint เป็น hash ตรงๆ ของ body ที่ normalize แล้ว
+        **ห้ามใช้ salt / secret / HMAC**
+
+        key เดิมกับ body คนละชุด → `409 IDEMPOTENCY_KEY_REUSED`
+      schema: { type: string, minLength: 8, maxLength: 255 }
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: จำนวนในหน่วยเล็กสุด · string เสมอ (RFD 14 L3)
+      examples: ['160000000000000000000']
+
+    ListingStatus:
+      type: string
+      enum: [PENDING, ACTIVE, SOLD, DELISTED, FAILED]
+
+    PurchaseStatus:
+      type: string
+      enum: [PENDING, SETTLED, FAILED]
+      description: |
+        `PENDING` เงินถูกกันไว้ ยังไม่ย้าย ·
+        `SETTLED` เงินและของย้ายแล้ว ·
+        `FAILED` tx revert · เงินที่กันไว้ถูกปล่อยคืน
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    BuyStepName:
+      type: string
+      enum: [approveTHB, executePurchase]
+
+    BuyRequest:
+      type: object
+      required: [expectedTotalPrice]
+      additionalProperties: false
+      properties:
+        expectedTotalPrice:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: |
+            ยอดรวมที่หน้าจอแสดงไว้ · ไม่ตรงกับที่ server คำนวณ → `409 PRICE_MISMATCH`
+
+    PurchaseAccepted:
+      type: object
+      required: [purchaseId, listingId, totalPrice, feeBps, feeAmount,
+                 netToSeller, status, operationId, stepCount]
+      properties:
+        purchaseId: { type: string, pattern: '^pur_[A-Za-z0-9]{6,}$' }
+        listingId: { type: string }
+        totalPrice: { $ref: '#/components/schemas/BaseUnits' }
+        feeBps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: อัตราที่มีผลตอนรับคำขอ · บันทึกไว้กับแถวนี้ตลอดไป
+        feeAmount: { $ref: '#/components/schemas/BaseUnits' }
+        netToSeller:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: '`feeAmount` บวกค่านี้ต้องเท่ากับ `totalPrice` พอดี'
+        status: { type: string, const: PENDING }
+        operationId: { type: string }
+        stepCount: { type: integer, const: 2 }
+
+    PurchaseView:
+      type: object
+      required: [purchaseId, listingId, buyerKind, buyerId, sellerKind, sellerId,
+                 unitPrice, quantity, totalPrice, feeBps, feeAmount, netToSeller,
+                 status, createdAt, settledAt]
+      properties:
+        purchaseId: { type: string }
+        listingId: { type: string }
+        buyerKind: { type: string, enum: [MERCHANT, CUSTOMER] }
+        buyerId: { type: string }
+        sellerKind: { type: string, enum: [MERCHANT, CUSTOMER] }
+        sellerId: { type: string }
+        unitPrice: { $ref: '#/components/schemas/BaseUnits' }
+        quantity: { type: integer, minimum: 1 }
+        totalPrice: { $ref: '#/components/schemas/BaseUnits' }
+        feeBps: { type: integer }
+        feeAmount: { $ref: '#/components/schemas/BaseUnits' }
+        netToSeller: { $ref: '#/components/schemas/BaseUnits' }
+        status: { $ref: '#/components/schemas/PurchaseStatus' }
+        createdAt: { type: string, format: date-time }
+        settledAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        couponCodeIds:
+          type: array
+          description: ผู้ซื้อเห็นช่องนี้หลัง `SETTLED` แล้วเท่านั้น
+          items: { type: string, pattern: '^cc_[A-Za-z0-9]{6,}$' }
+
+    BalanceView:
+      type: object
+      required: [asset, amount, reserved, available]
+      properties:
+        asset: { type: string, const: THB }
+        amount: { $ref: '#/components/schemas/BaseUnits' }
+        reserved: { $ref: '#/components/schemas/BaseUnits' }
+        available: { $ref: '#/components/schemas/BaseUnits' }
+
+    ListingView:
+      type: object
+      required: [listingId, sellerKind, sellerId, couponTypeId, unitPrice,
+                 quantity, totalPrice, status]
+      properties:
+        listingId: { type: string }
+        sellerKind: { type: string, enum: [MERCHANT, CUSTOMER] }
+        sellerId: { type: string }
+        couponTypeId: { type: string }
+        unitPrice: { $ref: '#/components/schemas/BaseUnits' }
+        quantity: { type: integer }
+        totalPrice:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: '`unitPrice` คูณ `quantity` · ซื้อทั้งใบเท่านั้น'
+        status: { $ref: '#/components/schemas/ListingStatus' }
+
+    OperationStepView:
+      type: object
+      required: [index, name, status, txHash, nonce]
+      properties:
+        index: { type: integer, minimum: 1, maximum: 2 }
+        name: { $ref: '#/components/schemas/BuyStepName' }
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{64}$' }, { type: 'null' }]
+        nonce:
+          oneOf: [{ type: integer, minimum: 0 }, { type: 'null' }]
+
+    OperationView:
+      type: object
+      required: [operationId, kind, status, createdAt, finalizedAt, steps]
+      properties:
+        operationId: { type: string }
+        kind: { type: string, const: LISTING_BUY }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        createdAt: { type: string, format: date-time }
+        finalizedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        errorNote:
+          oneOf: [{ type: string }, { type: 'null' }]
+        steps:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/OperationStepView' }
+
+    ErrorCode:
+      type: string
+      enum:
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - IDEMPOTENCY_KEY_IN_PROGRESS
+        - VALIDATION_FAILED
+        - LISTING_NOT_FOUND
+        - LISTING_NOT_ACTIVE
+        - LISTING_BUSY
+        - SELF_PURCHASE
+        - INSUFFICIENT_THB
+        - PRICE_MISMATCH
+        - FORBIDDEN
+        - RATE_LIMITED
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string }
+            requestId: { type: string }
+            details: { type: object, additionalProperties: true }
+
+  responses:
+    BadRequest:
+      description: คำขอไม่ถูกรูป · ไม่มี `Idempotency-Key`
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: token ไม่ถูกต้องหรือหมดอายุ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: ไม่พบรายการขาย หรือผู้เรียกไม่มีสิทธิ์เห็นแถวนั้น
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        | code | เมื่อไร |
+        |---|---|
+        | `INSUFFICIENT_THB` | ยอดที่ใช้ได้ไม่พอ · **ไม่มีการเสกเงินให้** (`F4`) |
+        | `LISTING_NOT_ACTIVE` | รายการไม่ได้อยู่สถานะ `ACTIVE` |
+        | `LISTING_BUSY` | มีคนกดซื้อหรือร้านกดถอดค้างอยู่ |
+        | `SELF_PURCHASE` | ซื้อรายการขายของตัวเอง |
+        | `PRICE_MISMATCH` | `expectedTotalPrice` ไม่ตรงกับที่ server คำนวณ |
+        | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body คนละชุด |
+        | `IDEMPOTENCY_KEY_IN_PROGRESS` | คำขอเดิมยังทำไม่เสร็จ · ลองใหม่ได้ |
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    RateLimited:
+      description: เรียกถี่เกินไป · ลองใหม่ได้
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }

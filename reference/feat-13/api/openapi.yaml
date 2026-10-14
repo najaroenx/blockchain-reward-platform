@@ -1,0 +1,560 @@
+openapi: 3.1.0
+info:
+  title: FEAT-13 · Operation Status + Webhook
+  version: 1.0.0
+  description: |
+    บอกโลกข้างนอกว่างานที่รับไว้เป็นอย่างไรแล้ว สองทาง — ดึง และ ส่ง
+
+    ทุก feature ก่อนหน้านี้ **เขียน** `operation` `operation_step`
+    `operation_event` · feature นี้คือตัวที่ **อ่าน** มันแล้วเล่าให้คนข้างนอกฟัง
+
+    ## ข้อสำคัญที่สุดสำหรับคนเขียน client
+
+    **`status` ไม่เดินหน้าทางเดียว** · ห้ามเขียนโค้ดที่สมมติว่าเดินหน้า
+
+    reorg ทำให้ `CONFIRMED` กลายเป็น `ORPHANED` ได้ ซึ่งดูเหมือนถอยหลัง
+    แต่ถูกต้องตามความจริงของ chain · client ที่ทิ้ง event ที่ "ถอยหลัง"
+    จะทิ้ง event ที่สำคัญที่สุดไป
+
+    ใช้ **`eventSeq`** เป็นตัวเทียบ · มันเพิ่มขึ้นเสมอ ไม่มีข้อยกเว้น
+    และเรียงติดกันไม่ขาดช่วง (`trg_opevent_chain_intact` บังคับ)
+
+    ```text
+    PENDING → SUBMITTED → CONFIRMED → ORPHANED → SUBMITTED → CONFIRMED → FINALIZED
+    seq 1       2            3           4          5           6            7
+    ```
+
+    ตัวอย่างข้างบนคือ reorg หนึ่งครั้ง · `status` ถอยที่ seq 4 แต่ `seq` ไม่ถอย
+
+    ## ประวัติครบเสมอ
+
+    `trg_status_has_event` ตรวจตอน `COMMIT` ว่าทุก operation ที่สถานะเปลี่ยน
+    มีแถว `operation_event` รองรับ · เปลี่ยนสถานะเงียบๆ โดยไม่เขียนประวัติ
+    จึงเป็นไปไม่ได้ และ `events[]` ที่ API คืนจึงครบจริง ไม่ใช่ครบเท่าที่โค้ดจำได้
+
+    ## webhook ของงานเดียวกันมาถึงเรียงตามลำดับ
+
+    `trg_delivery_order_gate` บังคับให้ delivery ลำดับก่อนหน้าจบ
+    (`SENT` หรือ `DEAD`) ก่อนจะยิงลำดับถัดไป ต่อหนึ่ง `(endpoint, operation)`
+
+    ทางเลือกที่ไม่เอา — ส่งขนานกันแล้วให้ร้านเรียงเอง
+    เพราะนั่นคือการย้ายปัญหาไปให้คนที่มีข้อมูลน้อยกว่าเรา
+
+    คิวของ endpoint แยกกัน · ร้านที่รับไม่ได้ไม่ทำให้ร้านอื่นรอ
+    และ delivery ที่ `DEAD` ไม่บล็อกลำดับถัดไป — รับไม่ได้ครั้งหนึ่ง
+    ไม่ควรแปลว่าไม่ได้รับอะไรอีกเลยตลอดกาล
+
+    ## Group E · ตารางที่ replay ไม่ได้
+
+    `RFD 6 §3.2` ตั้งกฎของ Group D ว่าลบทิ้งแล้ว replay `chain_event`
+    ต้องได้ค่าเดิมเป๊ะ และตั้งข้อสังเกตว่า `webhook_delivery` ทำแบบนั้นไม่ได้
+    จึงควรแยกเป็น Group E — **ค้างไว้ยังไม่ตัดสิน**
+
+    feature นี้ตัดสินว่า **แยก** เพราะ
+
+    - ลบแล้ว replay ไม่ได้แปลว่าได้ข้อมูลคืน แต่แปลว่า **ยิง webhook ไปหาร้านใหม่หมด**
+      ซึ่งเป็นผลข้างเคียงกับคนอื่น ไม่ใช่การสร้างตารางใหม่
+    - ไม่มีค่าไหนในตารางนี้ที่สืบกลับไปหา `chain_event` ได้เลย
+      `response_status` ที่ร้านตอบ · เวลาที่ยิงจริง · จำนวนครั้งที่ลอง
+      chain ไม่รู้เรื่องพวกนี้ และจะไม่มีวันรู้
+
+    | กลุ่ม | คืออะไร | ลบแล้ว |
+    |---|---|---|
+    | Group D | projection · สืบจาก chain ได้ | สร้างใหม่ได้ |
+    | Group E | บันทึกการทำงาน · หลักฐานว่าเราทำอะไรไป | หายเลย |
+
+servers:
+  - url: https://api.example.com
+    description: production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: operations
+    description: ติดตามสถานะงาน
+  - name: webhooks
+    description: ตั้งค่าปลายทางและดูประวัติการส่ง
+
+paths:
+  /v1/operations/{operationId}:
+    get:
+      tags: [operations]
+      summary: สถานะงานและประวัติทั้งหมด
+      operationId: getOperation
+      description: |
+        `events` เรียงตาม `seq` จากน้อยไปมาก และ **ไม่ขาดช่วง**
+        ถ้าเห็น seq กระโดด แปลว่ามีบั๊กที่ฝั่งเรา ไม่ใช่ที่ client
+
+        ### จะ poll ถี่แค่ไหน
+
+        ดู `Retry-After` ในคำตอบ · ค่าขึ้นกับสถานะปัจจุบัน
+
+        | สถานะ | `Retry-After` | เพราะ |
+        |---|---|---|
+        | `PENDING` | 2 | รอ worker หยิบ · เร็ว |
+        | `SUBMITTED` | 5 | รอ chain ยืนยัน |
+        | `CONFIRMED` | 15 | รอความลึกพอที่จะถือว่าจบ |
+        | `MANUAL_REVIEW` | 300 | รอคน · poll ถี่ไม่ช่วย |
+        | terminal | ไม่ส่งมา | จบแล้ว เลิก poll |
+
+        ถ้าตั้ง webhook ไว้แล้ว ไม่ต้อง poll เลยก็ได้
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[A-Za-z0-9]{6,}$' }
+        - name: If-None-Match
+          in: header
+          description: ส่ง `ETag` ที่ได้ครั้งก่อนมา · ไม่มีอะไรเปลี่ยนจะได้ `304`
+          schema: { type: string }
+      responses:
+        '200':
+          description: ok
+          headers:
+            ETag:
+              description: เปลี่ยนเมื่อมี event ใหม่ · ค่าอิงจาก `seq` ล่าสุด
+              schema: { type: string }
+            Retry-After:
+              description: วินาทีที่ควรรอก่อน poll ครั้งถัดไป · ไม่ส่งมาเมื่อจบแล้ว
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationView' }
+        '304':
+          description: ไม่มี event ใหม่ตั้งแต่ `ETag` ที่ส่งมา
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/operations:
+    get:
+      tags: [operations]
+      summary: งานของผู้เรียก เรียงใหม่ไปเก่า
+      operationId: listOperations
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/OperationStatus' }
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/OperationKind' }
+        - name: cursor
+          in: query
+          description: ค่า `nextCursor` จากหน้าก่อน
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/OperationSummary' }
+                  nextCursor:
+                    oneOf: [{ type: string }, { type: 'null' }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/webhook-endpoints:
+    get:
+      tags: [webhooks]
+      summary: ปลายทางที่ลงทะเบียนไว้
+      operationId: listEndpoints
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/EndpointView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      tags: [webhooks]
+      summary: ลงทะเบียนปลายทางใหม่
+      operationId: createEndpoint
+      description: |
+        `url` ต้องเป็น `https` · `http` ถูกปฏิเสธที่ฐานข้อมูล
+        ลายเซ็นกัน tamper ได้ แต่ไม่กันการอ่าน
+
+        `eventTypes` ต้องมีอย่างน้อยหนึ่งค่า · การรับทุกอย่างโดยไม่ได้เลือก
+        คือการเผลอ ไม่ใช่การตั้งค่า
+
+        ### secret
+
+        คำตอบคืน `secret` **ครั้งเดียวตอนสร้าง** หลังจากนั้นอ่านไม่ได้อีก
+        ฐานข้อมูลเก็บแค่ `kms://` reference ไม่ได้เก็บค่าความลับเอง
+        (`trg_endpoint_no_plain_secret` ปฏิเสธถ้าเผลอยัดค่าดิบลงไป)
+
+        ลืม secret แล้วต้องหมุนใหม่ ไม่ใช่ขอดูอันเดิม
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEndpointRequest' }
+      responses:
+        '201':
+          description: สร้างแล้ว · `secret` แสดงครั้งนี้ครั้งเดียว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/webhook-endpoints/{endpointId}/deliveries:
+    get:
+      tags: [webhooks]
+      summary: ประวัติการส่งของปลายทางนี้
+      operationId: listDeliveries
+      description: |
+        ใช้ดูว่าทำไมร้านไม่ได้รับ · `attempts` บอกคำตอบที่ร้านตอบกลับมาจริง
+        ทุกครั้ง พร้อมเวลาที่ใช้
+
+        ข้อมูลในนี้เป็น Group E · ลบแล้วไม่มีทางสร้างกลับ
+      parameters:
+        - name: endpointId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^ep_[A-Za-z0-9]{6,}$' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DeliveryStatus' }
+        - name: operationId
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/webhook-deliveries/{deliveryId}/replay:
+    post:
+      tags: [webhooks]
+      summary: ส่งซ้ำงานที่ DEAD
+      operationId: replayDelivery
+      description: |
+        **สร้างแถวใหม่** ไม่ใช่ปลุกแถวเดิม
+
+        แถวที่ `SENT` หรือ `DEAD` แล้วแก้ไม่ได้ (`trg_delivery_terminal_immutable`)
+        เพราะมันเป็นหลักฐานว่าเราส่งอะไรไปแล้วและได้คำตอบอะไร
+        แก้ย้อนหลังได้ก็เลิกเป็นหลักฐาน
+
+        แถวใหม่ได้ `deliverySeq` ถัดไปของคิวนั้น และเซ็นใหม่ด้วยเวลาใหม่
+      parameters:
+        - name: deliveryId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^wd_[A-Za-z0-9]{6,}$' }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: สร้างงานส่งใหม่แล้ว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        `SPEC-001` · UUID v4 · `[IK-23]` fingerprint เป็น hash ตรงๆ
+        **ห้ามใช้ salt / secret / HMAC**
+      schema: { type: string, minLength: 8, maxLength: 255 }
+
+  schemas:
+    OperationKind:
+      type: string
+      enum: [MERCHANT_PROVISION, POINT_TYPE_CREATE, POINT_TRANSFER,
+             COUPON_TYPE_CREATE, COUPON_ISSUE, COUPON_REDEEM,
+             LISTING_CREATE, LISTING_DELETE, LISTING_BUY, THB_MINT]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED,
+             CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+      description: |
+        **ไม่เดินหน้าทางเดียว** · `CONFIRMED` → `ORPHANED` เกิดได้จาก reorg
+        ใช้ `eventSeq` เทียบ ไม่ใช่ `status`
+
+        | สถานะ | จบหรือยัง |
+        |---|---|
+        | `PENDING` `SUBMITTED` `CONFIRMED` | ยัง · รอต่อ |
+        | `ORPHANED` | ยัง · จะถูกยิงใหม่ |
+        | `MANUAL_REVIEW` | ยัง · รอคน |
+        | `FINALIZED` `CHAIN_REVERTED` | จบ · เลิก poll |
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    DeliveryStatus:
+      type: string
+      enum: [PENDING, IN_FLIGHT, SENT, DEAD]
+
+    EndpointStatus:
+      type: string
+      enum: [ACTIVE, PAUSED, DISABLED]
+
+    OperationEventView:
+      type: object
+      required: [seq, fromStatus, toStatus, actor, createdAt]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+          description: เพิ่มขึ้นเสมอ เรียงติดกันไม่ขาดช่วง · ใช้ตัวนี้เทียบ
+        fromStatus:
+          oneOf: [{ $ref: '#/components/schemas/OperationStatus' }, { type: 'null' }]
+          description: เป็น `null` ที่ `seq` 1 เท่านั้น
+        toStatus: { $ref: '#/components/schemas/OperationStatus' }
+        actor: { type: string, enum: [SYSTEM, MERCHANT_ADMIN, CUSTOMER, PLATFORM_ADMIN] }
+        txHash:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{64}$' }, { type: 'null' }]
+        createdAt: { type: string, format: date-time }
+
+    OperationStepView:
+      type: object
+      required: [index, name, status, txHash]
+      properties:
+        index: { type: integer, minimum: 1 }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{64}$' }, { type: 'null' }]
+
+    OperationSummary:
+      type: object
+      required: [operationId, kind, status, eventSeq, createdAt]
+      properties:
+        operationId: { type: string }
+        kind: { $ref: '#/components/schemas/OperationKind' }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        eventSeq:
+          type: integer
+          description: '`seq` ของ event ล่าสุด · ใช้เทียบว่ามีอะไรใหม่'
+        createdAt: { type: string, format: date-time }
+
+    OperationView:
+      type: object
+      required: [operationId, kind, status, eventSeq, createdAt,
+                 finalizedAt, terminal, steps, events]
+      properties:
+        operationId: { type: string }
+        kind: { $ref: '#/components/schemas/OperationKind' }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        eventSeq: { type: integer, minimum: 1 }
+        createdAt: { type: string, format: date-time }
+        finalizedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        terminal:
+          type: boolean
+          description: 'true = เลิก poll ได้ · คำนวณจาก `status` ให้แล้ว'
+        errorNote:
+          oneOf: [{ type: string }, { type: 'null' }]
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStepView' }
+        events:
+          type: array
+          minItems: 1
+          description: เรียงตาม `seq` จากน้อยไปมาก และไม่ขาดช่วง
+          items: { $ref: '#/components/schemas/OperationEventView' }
+
+    CreateEndpointRequest:
+      type: object
+      required: [url, eventTypes]
+      additionalProperties: false
+      properties:
+        url: { type: string, format: uri, pattern: '^https://' }
+        eventTypes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string }
+        maxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 12
+          default: 6
+
+    EndpointView:
+      type: object
+      required: [endpointId, url, eventTypes, status, maxAttempts, createdAt]
+      properties:
+        endpointId: { type: string, pattern: '^ep_[A-Za-z0-9]{6,}$' }
+        url: { type: string }
+        eventTypes:
+          type: array
+          items: { type: string }
+        status: { $ref: '#/components/schemas/EndpointStatus' }
+        maxAttempts: { type: integer }
+        createdAt: { type: string, format: date-time }
+
+    EndpointCreated:
+      allOf:
+        - $ref: '#/components/schemas/EndpointView'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: |
+                แสดงครั้งนี้ครั้งเดียว · อ่านไม่ได้อีก
+                ใช้ตรวจ `X-Signature` ของ webhook ที่เราส่งไป
+
+    DeliveryAttemptView:
+      type: object
+      required: [attempt, startedAt, finishedAt]
+      description: |
+        Group E · ไม่มีค่าไหนในนี้ที่สืบจาก `chain_event` ได้
+      properties:
+        attempt: { type: integer, minimum: 1 }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        responseStatus:
+          oneOf: [{ type: integer, minimum: 100, maximum: 599 }, { type: 'null' }]
+        responseBody:
+          oneOf: [{ type: string }, { type: 'null' }]
+        errorNote:
+          oneOf: [{ type: string }, { type: 'null' }]
+          description: มีค่าเมื่อไม่ได้คำตอบเลย · มีได้อย่างใดอย่างหนึ่งกับ `responseStatus`
+
+    DeliveryView:
+      type: object
+      required: [deliveryId, operationId, eventSeq, deliverySeq, eventType,
+                 status, attempt, nextAttemptAt, attempts]
+      properties:
+        deliveryId: { type: string, pattern: '^wd_[A-Za-z0-9]{6,}$' }
+        operationId: { type: string }
+        eventSeq: { type: integer }
+        deliverySeq:
+          type: integer
+          description: ลำดับในคิวของ `(endpoint, operation)` · ส่งเรียงตามนี้
+        eventType: { type: string }
+        status: { $ref: '#/components/schemas/DeliveryStatus' }
+        attempt:
+          type: integer
+          description: ตรงกับจำนวนแถวใน `attempts` เสมอ
+        nextAttemptAt: { type: string, format: date-time }
+        sentAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        deadAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        attempts:
+          type: array
+          items: { $ref: '#/components/schemas/DeliveryAttemptView' }
+
+    WebhookBody:
+      type: object
+      description: |
+        สิ่งที่เราส่งไปที่ `url` ของร้าน
+
+        ### ตรวจลายเซ็น
+
+        header `X-Signature` คือ `sha256=<hex>` ของ
+        `HMAC-SHA256(secret, "<signedAt>.<raw body>")`
+
+        ใส่ `signedAt` ในสิ่งที่เซ็น เพื่อให้ร้านปฏิเสธ body เก่าที่ถูกเก็บไว้
+        แล้วส่งซ้ำได้ · ร้านควรปฏิเสธถ้า `signedAt` เก่ากว่า 5 นาที
+
+        ตรวจจาก **byte ดิบ** ที่ได้มา ไม่ใช่จาก JSON ที่ parse แล้ว serialize ใหม่
+      required: [eventType, operationId, eventSeq, status, signedAt]
+      properties:
+        eventType: { type: string }
+        operationId: { type: string }
+        eventSeq:
+          type: integer
+          description: ใช้ตัวนี้เทียบว่าใหม่กว่าที่เคยได้หรือไม่
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        signedAt: { type: string, format: date-time }
+        data: { type: object, additionalProperties: true }
+
+    ErrorCode:
+      type: string
+      enum:
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - VALIDATION_FAILED
+        - OPERATION_NOT_FOUND
+        - ENDPOINT_NOT_FOUND
+        - DELIVERY_NOT_FOUND
+        - DELIVERY_NOT_DEAD
+        - URL_NOT_HTTPS
+        - FORBIDDEN
+        - RATE_LIMITED
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string }
+            requestId: { type: string }
+            details: { type: object, additionalProperties: true }
+
+  responses:
+    BadRequest:
+      description: คำขอไม่ถูกรูป · ไม่มี `Idempotency-Key`
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: token ไม่ถูกต้องหรือหมดอายุ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: ไม่พบ หรือไม่ใช่ของผู้เรียก
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        | code | เมื่อไร |
+        |---|---|
+        | `URL_NOT_HTTPS` | `url` เป็น `http` |
+        | `DELIVERY_NOT_DEAD` | สั่งส่งซ้ำงานที่ยังไม่ `DEAD` |
+        | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body คนละชุด |
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }

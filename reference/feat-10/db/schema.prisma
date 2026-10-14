@@ -1,0 +1,482 @@
+// =====================================================================
+// FEAT-10 · Buy Coupon · schema.prisma
+//
+// ไฟล์นี้สะท้อน db/migration.sql · migration เป็นต้นฉบับ ไม่ใช่ไฟล์นี้
+//
+// สิ่งที่หายไปถ้าให้ Prisma generate migration เอง
+//   · constraint trigger ที่ DEFERRABLE INITIALLY DEFERRED สองตัว
+//     ซึ่งเป็นกฎที่สำคัญที่สุดของ feature นี้ทั้งคู่
+//   · advisory lock ในการตรวจยอด THB
+//   · partial unique index
+//   · ข้อความ error ภาษาไทยที่ service ใช้แยกกรณี
+//
+// วิธีใช้
+//   1  psql -d <db> -f db/migration.sql
+//   2  npx prisma db pull   (ตรวจว่าตรงกัน)
+//   3  npx prisma generate
+//   4  ลบโฟลเดอร์ typings/ ทิ้ง
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------ enum
+enum operation_kind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+}
+
+enum operation_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+}
+
+enum step_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+}
+
+enum merchant_status {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum coupon_type_status {
+  REQUESTED
+  LIVE
+  FAILED
+  RETIRED
+}
+
+enum coupon_code_state {
+  ISSUED
+  HELD
+  REDEEMED
+  EXPIRED
+  VOIDED
+}
+
+enum holder_kind {
+  MERCHANT
+  CUSTOMER
+}
+
+enum actor_type {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+}
+
+enum reservation_subject {
+  POINT_BALANCE
+  COUPON_UNIT
+  LISTING
+  THB_BALANCE
+  ESCROW
+}
+
+enum listing_status {
+  PENDING
+  ACTIVE
+  SOLD
+  DELISTED
+  FAILED
+}
+
+enum listing_close_reason {
+  CANCELLED
+  SOLD
+}
+
+enum purchase_status {
+  PENDING
+  SETTLED
+  FAILED
+}
+
+/// ISSUANCE เป็นบัญชีคู่ของการนำ THB เข้าระบบ · ยอดติดลบเป็นเรื่องปกติ
+/// ค่าติดลบของมันเท่ากับ THB ที่หมุนอยู่ในระบบทั้งหมด
+enum ledger_account {
+  CUSTOMER_THB
+  MERCHANT_THB
+  PLATFORM_THB
+  ISSUANCE
+}
+
+// ------------------------------------------------------------ ตัวตน
+model merchant {
+  id         String          @id
+  name       String
+  status     merchant_status @default(PENDING)
+  created_at DateTime        @default(now()) @db.Timestamptz(6)
+
+  coupon_types coupon_type[]
+
+  @@map("merchant")
+}
+
+model customer {
+  id         String   @id
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("customer")
+}
+
+model signer {
+  address    Bytes   @id
+  key_ref    String
+  next_nonce BigInt  @default(0)
+  enabled    Boolean @default(true)
+
+  steps operation_step[]
+
+  @@map("signer")
+}
+
+model coupon_type {
+  id           String             @id
+  merchant_id  String
+  name         String
+  face_value   Decimal            @db.Decimal(78, 0)
+  total_supply Int
+  status       coupon_type_status @default(REQUESTED)
+  expires_at   DateTime           @db.Timestamptz(6)
+
+  merchant merchant      @relation(fields: [merchant_id], references: [id])
+  codes    coupon_code[]
+  listings listing[]
+
+  @@map("coupon_type")
+}
+
+model coupon_code {
+  id             String            @id
+  coupon_type_id String
+  code_hash      Bytes
+  code_ref       Bytes
+  state          coupon_code_state @default(ISSUED)
+  holder_kind    holder_kind?
+  holder_id      String?
+
+  coupon_type coupon_type     @relation(fields: [coupon_type_id], references: [id])
+  items       listing_item[]
+  holding     coupon_holding?
+
+  @@unique([code_hash], map: "uq_code_hash")
+  @@unique([code_ref], map: "uq_code_ref")
+  @@map("coupon_code")
+}
+
+// ------------------------------------------------------- รายการขาย
+/// trg_listing_price_immutable · ราคาและจำนวนแก้ไม่ได้หลังพ้น PENDING
+model listing {
+  id             String         @id
+  seller_kind    holder_kind
+  seller_id      String
+  coupon_type_id String
+  unit_price     Decimal        @db.Decimal(78, 0)
+  quantity       Int
+  status         listing_status @default(PENDING)
+  created_at     DateTime       @default(now()) @db.Timestamptz(6)
+  active_at      DateTime?      @db.Timestamptz(6)
+  closed_at      DateTime?      @db.Timestamptz(6)
+
+  coupon_type coupon_type    @relation(fields: [coupon_type_id], references: [id])
+  items       listing_item[]
+  chain       listing_chain?
+  purchases   purchase[]
+
+  @@index([seller_kind, seller_id, status], map: "ix_listing_seller")
+  @@map("listing")
+}
+
+model listing_item {
+  id             String @id
+  listing_id     String
+  coupon_code_id String
+
+  listing     listing     @relation(fields: [listing_id], references: [id], onDelete: Cascade)
+  coupon_code coupon_code @relation(fields: [coupon_code_id], references: [id])
+
+  @@unique([listing_id, coupon_code_id], map: "uq_item_in_listing")
+  @@index([coupon_code_id], map: "ix_item_code")
+  @@map("listing_item")
+}
+
+model listing_chain {
+  listing_id       String                @id
+  contract_address Bytes
+  chain_listing_id Decimal               @db.Decimal(78, 0)
+  created_block    BigInt
+  created_tx_hash  Bytes
+  closed_block     BigInt?
+  closed_tx_hash   Bytes?
+  close_reason     listing_close_reason?
+  applied_at       DateTime              @default(now()) @db.Timestamptz(6)
+
+  listing listing @relation(fields: [listing_id], references: [id])
+
+  @@unique([contract_address, chain_listing_id], map: "uq_listing_chain")
+  @@map("listing_chain")
+}
+
+// ================================================= เงินและค่าธรรมเนียม
+/// อัตราที่ใช้คืออัตราที่มีผลตอนซื้อ · f_fee_bps_at(ts) เป็นตัวหา
+/// เปลี่ยนอัตราวันนี้ไม่กระทบยอดของการซื้อเมื่อวาน
+model fee_schedule {
+  id             String   @id
+  bps            Int
+  effective_from DateTime @unique(map: "uq_fee_effective") @db.Timestamptz(6)
+  note           String?
+
+  @@map("fee_schedule")
+}
+
+/// ยอดคงเหลือ · projection ของ ledger_entry ไม่ใช่ค่าที่ตั้งเองได้
+///
+/// trg_balance_matches_ledger (DEFERRED) บังคับว่า
+///   amount = SUM(ledger_entry.amount) ของบัญชีเดียวกัน ตอน COMMIT
+/// นี่คือคำตอบเชิงโครงสร้างต่อ F4 · เพิ่มยอดฝั่งเดียวไม่ได้เลย
+///
+/// account_id เขียนเป็น '<ACCOUNT>:<id>' เพื่อให้ตรงกับ
+/// reservation.subject_id ของ THB_BALANCE แบบตัวต่อตัว
+model thb_balance {
+  account    ledger_account
+  account_id String
+  amount     Decimal        @default(0) @db.Decimal(78, 0)
+  updated_at DateTime       @default(now()) @db.Timestamptz(6)
+
+  @@id([account, account_id])
+  @@map("thb_balance")
+}
+
+/// สมุดบัญชีคู่ · ผลรวมต่อหนึ่ง operation ต้องเป็นศูนย์
+///
+/// trg_ledger_balanced (DEFERRED) ตรวจตอน COMMIT
+/// เครื่องหมายมีความหมาย · ลบคือออก บวกคือเข้า · amount = 0 ไม่ยอมรับ
+///
+/// F8 คือการที่เงินไม่ถึงผู้ขายโดยไม่มีอะไรส่งเสียง
+/// ตารางนี้ทำให้ความเงียบแบบนั้นเป็นไปไม่ได้
+model ledger_entry {
+  id           String         @id
+  operation_id String
+  entry_seq    Int
+  account      ledger_account
+  account_id   String
+  asset        String         @default("THB")
+  amount       Decimal        @db.Decimal(78, 0)
+  memo         String?
+  created_at   DateTime       @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id])
+
+  @@unique([operation_id, entry_seq], map: "uq_ledger_seq")
+  @@index([account, account_id, created_at], map: "ix_ledger_account")
+  @@map("ledger_entry")
+}
+
+/// trg_purchase_math ตรวจเลขสามทาง
+///   total = unit_price x quantity
+///   fee + net = total  (ไม่ขาดไม่เกินแม้หนึ่งหน่วยเล็กสุด)
+///   fee = div(total x fee_bps, 10000)  (ปัดลง · เศษเป็นของผู้ขาย)
+model purchase {
+  id            String          @id
+  listing_id    String
+  buyer_kind    holder_kind
+  buyer_id      String
+  seller_kind   holder_kind
+  seller_id     String
+  unit_price    Decimal         @db.Decimal(78, 0)
+  quantity      Int
+  total_price   Decimal         @db.Decimal(78, 0)
+  fee_bps       Int
+  fee_amount    Decimal         @db.Decimal(78, 0)
+  net_to_seller Decimal         @db.Decimal(78, 0)
+  status        purchase_status @default(PENDING)
+  operation_id  String
+  created_at    DateTime        @default(now()) @db.Timestamptz(6)
+  settled_at    DateTime?       @db.Timestamptz(6)
+
+  listing   listing   @relation(fields: [listing_id], references: [id])
+  operation operation @relation(fields: [operation_id], references: [id])
+
+  @@index([buyer_kind, buyer_id, created_at], map: "ix_purchase_buyer")
+  @@map("purchase")
+}
+
+/// ใครถือคูปองใบไหน · ย้ายมือได้เฉพาะเมื่อมี chain_event รองรับ
+/// chain_event_id เป็น NOT NULL โดยตั้งใจ · ไม่มี event ไม่มีการย้าย
+model coupon_holding {
+  coupon_code_id String      @id
+  holder_kind    holder_kind
+  holder_id      String
+  chain_event_id String
+  applied_at     DateTime    @default(now()) @db.Timestamptz(6)
+
+  coupon_code coupon_code @relation(fields: [coupon_code_id], references: [id])
+  chain_event chain_event @relation(fields: [chain_event_id], references: [id])
+
+  @@index([holder_kind, holder_id], map: "ix_holding_holder")
+  @@map("coupon_holding")
+}
+
+// -------------------------------------------- Group B · แกน write path
+model idempotency_key {
+  id              String   @id
+  scope           String
+  key             String
+  fingerprint     Bytes
+  operation_id    String?
+  response_status Int?
+  response_body   Json?
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  expires_at      DateTime @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+/// trg_buy_admissible อ่าน actor_scope เพื่อตรวจว่าคนซื้อไม่ใช่คนขาย
+/// actor_scope มาจาก token ที่ผ่าน auth แล้ว ไม่ใช่จาก body
+model operation {
+  id           String           @id
+  actor_scope  String
+  kind         operation_kind
+  status       operation_status @default(PENDING)
+  subject_id   String?
+  payload      Json
+  error_note   String?
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  finalized_at DateTime?        @db.Timestamptz(6)
+
+  steps        operation_step[]
+  outbox       outbox[]
+  reservations reservation[]
+  events       operation_event[]
+  idem_keys    idempotency_key[]
+  chain_events chain_event[]
+  ledger       ledger_entry[]
+  purchases    purchase[]
+
+  @@map("operation")
+}
+
+model operation_step {
+  id             String      @id
+  operation_id   String
+  step_index     Int
+  name           String
+  signer_address Bytes?
+  nonce          BigInt?
+  raw_tx         Bytes?
+  tx_hash        Bytes?
+  status         step_status @default(PENDING)
+  submitted_at   DateTime?   @db.Timestamptz(6)
+  confirmed_at   DateTime?   @db.Timestamptz(6)
+  finalized_at   DateTime?   @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+  signer    signer?   @relation(fields: [signer_address], references: [address])
+
+  @@unique([operation_id, step_index], map: "uq_step_order")
+  @@unique([operation_id, name], map: "uq_step_name")
+  @@map("operation_step")
+}
+
+model outbox {
+  id           String    @id
+  operation_id String
+  topic        String
+  payload      Json
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  sent_at      DateTime? @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("outbox")
+}
+
+/// THB ไม่อยู่ใน uq_reservation_exclusive เพราะเป็นของบวกกันได้
+/// trg_thb_reservation_balance ใช้ advisory lock ต่อบัญชีแทน
+/// แล้วคำนวณ f_available_thb = ยอดคงเหลือ ลบ ที่จองค้างอยู่
+model reservation {
+  id           String              @id
+  operation_id String
+  subject_type reservation_subject
+  subject_id   String
+  amount       Decimal             @db.Decimal(78, 0)
+  created_at   DateTime            @default(now()) @db.Timestamptz(6)
+  released_at  DateTime?           @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@index([operation_id], map: "ix_reservation_by_op")
+  @@map("reservation")
+}
+
+model operation_event {
+  id           String            @id
+  operation_id String
+  from_status  operation_status?
+  to_status    operation_status
+  actor        actor_type        @default(SYSTEM)
+  tx_hash      Bytes?
+  metadata     Json              @default("{}")
+  created_at   DateTime          @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@index([operation_id, created_at], map: "ix_opevent_by_op")
+  @@map("operation_event")
+}
+
+// --------------------------------------------- Group C · ฝั่งอ่าน chain
+model chain_event {
+  id              String    @id
+  block_number    BigInt
+  block_hash      Bytes
+  tx_hash         Bytes
+  log_index       Int
+  address         Bytes
+  topic0          Bytes
+  topics          Json      @default("[]")
+  data            Bytes
+  block_timestamp DateTime  @db.Timestamptz(6)
+  operation_id    String?
+  orphaned_at     DateTime? @db.Timestamptz(6)
+  applied_at      DateTime? @db.Timestamptz(6)
+
+  operation operation?       @relation(fields: [operation_id], references: [id])
+  holdings  coupon_holding[]
+
+  @@unique([tx_hash, log_index], map: "uq_chain_event")
+  @@map("chain_event")
+}

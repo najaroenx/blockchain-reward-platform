@@ -1,0 +1,39 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> PENDING : ลงขาย · FEAT-08
+
+    PENDING --> FAILED : สร้างบน chain ไม่สำเร็จ
+    PENDING --> ACTIVE : lockInVault FINALIZED
+
+    note right of PENDING
+        ถอดไม่ได้
+        ยังไม่มี chain_listing_id
+        จะยกเลิกอะไรบน chain ไม่ได้
+    end note
+
+    ACTIVE --> DELISTED : cancelListing สำเร็จ · FEAT-09
+    ACTIVE --> SOLD : มีคนซื้อ · FEAT-10
+
+    note right of ACTIVE
+        สถานะเดียวที่ถอดได้
+        และถอดได้ทีละงาน
+        uq_listing_inflight
+    end note
+
+    DELISTED --> [*]
+    SOLD --> [*]
+    FAILED --> [*]
+
+    note left of DELISTED
+        ปลายทาง
+        ปลุกกลับไป ACTIVE ไม่ได้
+        ลงขายใหม่ = listing ใบใหม่
+        คูปองยัง HELD กับร้านเดิม
+    end note
+
+    note left of SOLD
+        ถอดที่แพ้การแข่งจบที่นี่
+        operation CHAIN_REVERTED
+        close_reason SOLD
+    end note

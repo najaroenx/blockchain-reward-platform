@@ -1,0 +1,63 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant A as api
+    participant D as PostgreSQL
+    participant J as notify job
+    participant M as ผู้ส่งข้อความ
+
+    rect rgb(248,249,250)
+    Note over C,D: อ่านยอด · ไม่มี transaction ไม่มี chain
+    C->>+A: GET /v1/point-balances?pointTypeId&holderId&asOf
+    A->>A: asOf ไม่ส่งมา → ใช้เวลาปัจจุบันของ server
+    A->>+D: f_unexpired_total(pt, kind, holder, as_of)
+    Note right of D: index ix_bucket_live<br/>equality 3 ตัว แล้ว range บน expires_at<br/>INCLUDE amount จึง index-only scan
+    D-->>-A: ยอดที่ยังไม่หมดอายุ
+    A->>+D: f_reserved_total(pt, kind, holder)
+    D-->>-A: ยอดที่ถูกกันไว้
+    A->>+D: SELECT bucket ที่ amount > 0 ORDER BY expires_at
+    D-->>-A: รายการ bucket
+    A->>+D: watermark เทียบ indexer_cursor
+    D-->>-A: asOfBlock และ lagBlocks
+    A->>A: available = max(unexpired - reserved, 0)
+    A-->>-C: { available, reserved, buckets[], freshness }
+    end
+
+    Note over C,D: ถามอดีตหรืออนาคตด้วย query เดียวกัน
+    C->>+A: GET /v1/point-balances?asOf=2026-10-31
+    A->>+D: ฟังก์ชันเดิม · ส่ง as_of คนละค่า
+    D-->>-A: ก้อนที่จะหมดอายุก่อนวันนั้นถูกตัดออกเอง
+    A-->>-C: ยอดของวันนั้น
+    Note right of A: ไม่มี job ไปลดยอด<br/>เวลาเดินเอง คำตอบเปลี่ยนเอง
+
+    Note over C,D: พยากรณ์การหมดอายุ
+    C->>+A: GET /v1/point-balances/expiry-forecast?horizonDays=30
+    A->>+D: f_expiry_forecast(...)
+    D-->>-A: รวมตามวัน เรียงจากใกล้ไปไกล
+    A-->>-C: { totalExpiring, days[] }
+
+    rect rgb(248,249,250)
+    Note over J,M: แจ้งเตือนล่วงหน้า · job รันเป็นรอบ
+    J->>+D: หา bucket ที่ใกล้หมดอายุและยังไม่เคยแจ้งที่ระดับนี้
+    Note right of D: LEFT JOIN expiry_notice<br/>แล้วกรอง n.id IS NULL
+    D-->>-J: รายการ bucket
+    loop แต่ละ bucket
+        J->>+M: ส่งข้อความ
+        M-->>-J: สำเร็จ
+        J->>D: INSERT expiry_notice (bucket_id, threshold_days)
+        alt เคยบันทึกไปแล้ว
+            D-->>J: unique_violation → 409
+            Note right of J: ไม่ใช่ error ที่ต้องแก้<br/>แปลว่า job อีกตัวทำไปแล้ว
+        else bucket หมดอายุไปแล้ว
+            D-->>J: check_violation → 422
+        end
+    end
+    end

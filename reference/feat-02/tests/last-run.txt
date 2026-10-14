@@ -1,0 +1,54 @@
+  #   |                           ข้อรับประกัน                           |  ผล  
+------+---------------------------------------------------------------+------
+ T1   | เบอร์สามรูป (0xx · +66xx · 66xx) และมีขีด → ค่าเดียวกัน              | PASS
+ T2   | เบอร์รูปที่ไม่รู้จัก → ถูกปฏิเสธ                                        | PASS
+ T3   | เบอร์ที่ยังไม่ normalize → ถูกปฏิเสธ                                 | PASS
+ T4   | F6 · otp_challenge ไม่มีคอลัมน์ที่เก็บ OTP ได้ · มีแต่ code_hash        | PASS
+ T5   | code_hash ต้อง 32 byte · pepper_ref ต้องเป็น kms:// ไม่ใช่ค่าดิบ     | PASS
+ T6   | L6 · wallet ไม่มีคอลัมน์เก็บ key · มีแต่ kms_key_ref                 | PASS
+ T7   | L6 · ALTER TABLE เพิ่ม private_key → ถูกปฏิเสธที่ชั้น DDL             | PASS
+ T8   | L6 · encrypted_key · mnemonic · sk · seed_phrase ถูกปฏิเสธทั้งหมด | PASS
+ T9   | L6 · CREATE TABLE ที่มี privkey → ถูกปฏิเสธ                        | PASS
+ T10  | คอลัมน์ชื่อธรรมดา (label) เพิ่มได้ปกติ · กฎไม่กว้างเกิน                  | PASS
+ T11  | kms_key_ref ที่เป็นค่าดิบ → ถูกปฏิเสธ                                | PASS
+ T12  | event trigger มีอยู่จริงและเปิดใช้งาน                               | PASS
+ T13  | ขอ OTP ซ้ำภายใน cooldown → ถูกปฏิเสธ                             | PASS
+ T14  | หนึ่งเบอร์มี challenge PENDING ได้อันเดียว                           | PASS
+ T15  | ขอ OTP ครบโควตาในหนึ่งชั่วโมง → ถูกปฏิเสธ                           | PASS
+ T16  | เบอร์ที่ถูกล็อก → ขอ OTP ไม่ได้                                      | PASS
+ T17  | ใส่รหัสผิด → WRONG_CODE · attempts เป็น 1                         | PASS
+ T18  | ใส่รหัสถูก → OK · VERIFIED · verified_at ถูกเติม                   | PASS
+ T19  | ยืนยันซ้ำหลัง VERIFIED → ALREADY_USED                             | PASS
+ T20  | ใส่ผิดครบ 5 ครั้ง → LOCKED · เบอร์ถูกล็อกด้วย                         | PASS
+ T21  | LOCKED แล้วใส่รหัสถูกก็ไม่ผ่าน → LOCKED                              | PASS
+ T22  | attempts เกิน max_attempts → ถูกปฏิเสธ                           | PASS
+ T23  | challenge ที่หมดอายุ → EXPIRED · ใส่รหัสถูกก็ไม่ผ่าน                   | PASS
+ T24  | F7 · แก้เบอร์ใน challenge → ถูกปฏิเสธ                             | PASS
+ T25  | แก้ code_hash หรือ expires_at → ถูกปฏิเสธ                         | PASS
+ T26  | F7 · สร้างลูกค้าโดยไม่อ้าง challenge → ถูกปฏิเสธ                     | PASS
+ T27  | F7 · เบอร์ไม่ตรงกับ challenge → ถูกปฏิเสธ                          | PASS
+ T28  | F7 · challenge ที่ยังไม่ VERIFIED → ถูกปฏิเสธ                       | PASS
+ T29  | สมัครด้วย challenge ที่ถูก → ผ่าน · เบอร์มาจาก challenge             | PASS
+ T30  | challenge ที่ CONSUMED แล้ว ใช้สมัครอีกไม่ได้                         | PASS
+ T31  | เปลี่ยนเบอร์ลูกค้าตรงๆ → ถูกปฏิเสธ                                   | PASS
+ T32  | F12 · customer ไม่มีคอลัมน์รหัสผ่าน                                 | PASS
+ T33  | F12 · ยืนยันแล้วได้ session ทันที                                   | PASS
+ T34  | session เก็บแต่ token_hash · ไม่มีคอลัมน์เก็บ token                  | PASS
+ T35  | wallet ซ้ำต่อเจ้าของเดียว → ถูกปฏิเสธ                               | PASS
+ T36  | สองงาน provision บนลูกค้าเดียว → ถูกปฏิเสธ                         | PASS
+ T37  | attempts นับไม่ตรงกับแถวจริง → ไม่ผ่าน                              | PASS
+ T38  | ปิดท้าย · ไม่มีคอลัมน์ชื่อเข้าข่ายความลับทั้งฐานข้อมูล                       | PASS
+ T21b | ยิงรัวตอนล็อกแล้ว · บันทึกครบแต่ attempts ยังเป็น 5                    | PASS
+(39 rows)
+
+ ผ่าน | ไม่ผ่าน 
+-----+-------
+  39 |     0
+(1 row)
+
+--- tests/contract-check.py ---
+contract ของ api/openapi.yaml · 11 schemas · ผ่านทั้งหมด
+  F6  ไม่มีช่อง OTP ในคำตอบ และปิด additionalProperties
+  F7  ไม่มีช่องเบอร์โทรในคำขอยืนยัน และปิด additionalProperties
+  F10 F13 L6  ไม่มี schema ไหนมีช่องเกี่ยวกับ key
+  F12 ไม่มีช่องรหัสผ่าน และผลการยืนยันมี accessToken

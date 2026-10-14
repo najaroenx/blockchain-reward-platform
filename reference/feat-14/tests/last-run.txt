@@ -1,0 +1,44 @@
+  #  |                                ข้อรับประกัน                                |  ผล  
+-----+-------------------------------------------------------------------------+------
+ T1  | cursor แถวที่สอง → ถูกปฏิเสธ                                                | PASS
+ T2  | L8 · ขยับ cursor โดยไม่มี lease → ถูกปฏิเสธ                                  | PASS
+ T3  | lease หมดอายุแล้วขยับ cursor → ถูกปฏิเสธ                                     | PASS
+ T4  | เปลี่ยนเจ้าของ lease พร้อมขยับ cursor → ถูกปฏิเสธ                              | PASS
+ T5  | ถือ lease อยู่ · ขยับ cursor ได้                                             | PASS
+ T6  | cursor ถอยหลังนอกเหตุ reorg → ถูกปฏิเสธ                                     | PASS
+ T7  | RFD 5 · parent_hash ไม่ตรง → ถูกปฏิเสธ                                     | PASS
+ T8  | บล็อกที่ไม่มีตัวก่อนหน้า · รับได้ ไม่มีอะไรให้เทียบ                                   | PASS
+ T9  | block_hash ซ้ำ → ชน primary key                                          | PASS
+ T10 | บล็อกที่เป็น parent ของตัวเอง → ถูกปฏิเสธ                                      | PASS
+ T11 | L8 · event ที่บล็อกเกิน cursor → ไม่ผ่าน                                      | PASS
+ T12 | L8 · event พร้อมขยับ cursor ใน tx เดียว → ผ่าน                              | PASS
+ T13 | อ่าน log ช่วงเดิมซ้ำ → ไม่เกิดแถวซ้ำ                                           | PASS
+ T14 | event ที่รู้จักชนิดแต่ไม่มี args → ถูกปฏิเสธ                                       | PASS
+ T15 | event ที่อ้าง block ที่ไม่มีอยู่ → ถูกปฏิเสธ                                       | PASS
+ T16 | apply ครบ · คูปองย้ายถูก · point 700 กับ 300 · ใบที่ใช้แล้วหายจาก holding       | PASS
+ T17 | apply ซ้ำไม่นับสอง · ยอดยังเป็น 700                                          | PASS
+ T18 | event ชนิดที่ไม่รู้จัก · apply แล้วแต่ไม่แตะ projection                           | PASS
+ T19 | event ที่อ้าง code_ref ที่ไม่มี → ถูกปฏิเสธตอน apply                             | PASS
+ T20 | RFD 6 · ลบแล้ว replay · coupon_holding เหมือนเดิมเป๊ะ                       | PASS
+ T21 | RFD 6 · ลบแล้ว replay · point_balance เหมือนเดิมเป๊ะ                        | PASS
+ T22 | RFD 6 · state ของ coupon_code เหมือนเดิมเป๊ะ                               | PASS
+ T23 | as_of_time มาจาก block ไม่ใช่เวลาที่ apply · จำนวน event เท่าเดิม             | PASS
+ T24 | reorg ลึก 1 → ROLLED_BACK · cursor ถอยไป 44 · event หลุด · projection ย้อน | PASS
+ T25 | หลัง reorg · projection กลับไปเหมือน snapshot ก่อนบล็อกที่หลุด                  | PASS
+ T26 | สายใหม่เขียนได้ · ความสูง 45 มีสองใบ · tip ชี้ใบใหม่                            | PASS
+ T27 | event ที่ final แล้ว orphan ไม่ได้                                           | PASS
+ T28 | final เฉพาะบล็อกที่ลึกกว่า N · tip 45 · N 12 → ถึง 33                         | PASS
+ T29 | reorg ที่กิน event final → MANUAL_REVIEW · ไม่แตะอะไรเลย                    | PASS
+ T30 | reorg ลึกเกิน N แต่อ้าง ROLLED_BACK → ถูกปฏิเสธ                               | PASS
+ T31 | depth ไม่ตรงกับช่วงบล็อก → ถูกปฏิเสธ                                          | PASS
+ T32 | N อิงเวลา · วันนี้ 12 · อนาคต 6                                             | PASS
+ T33 | event ที่ orphan แล้ว ทำเครื่องหมาย applied ไม่ได้                             | PASS
+ T34 | จ่าย point จากบัญชีที่ไม่มียอด → ถูกปฏิเสธ                                       | PASS
+ T35 | จ่าย point เกินยอดที่มี → ยอดติดลบ ถูกปฏิเสธ                                    | PASS
+ T36 | ปิดท้าย · ไม่มี event เกิน cursor · สายโซ่บล็อกไม่ขาด                           | PASS
+(36 rows)
+
+ ผ่าน | ไม่ผ่าน 
+-----+-------
+  36 |     0
+(1 row)

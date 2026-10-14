@@ -1,0 +1,275 @@
+openapi: 3.1.0
+info:
+  title: FEAT-14 · Indexer + Projector
+  version: 1.0.0
+  description: |
+    อ่าน log จาก chain แล้วแปลงเป็นตารางที่ api อ่านได้
+
+    pack นี้เป็นฝั่งตรงข้ามของทุก pack ก่อนหน้า — pack อื่นเขียน `operation`
+    แล้วยิง tx ออกไป · pack นี้อ่านผลที่กลับมาแล้วเขียน projection
+
+    endpoint ในนี้เป็นของฝ่าย ops ไม่ใช่ของร้านหรือลูกค้า
+    ตัว indexer เองไม่มี endpoint — มันเป็น process ที่อ่าน chain
+    และเขียนฐานข้อมูล
+
+    ## สามข้อที่ pack นี้ทำให้เป็นจริงในระดับ schema
+
+    | ข้อ | กลไก |
+    |---|---|
+    | `L8` indexer เดียว | `indexer_cursor` แถวเดียว + lease + advisory lock |
+    | `L8` cursor ขยับพร้อม event | `trg_event_within_cursor` ตรวจตอน `COMMIT` |
+    | `RFD 5` reorg ด้วย hash | `trg_block_links_to_parent` · สายโซ่ที่ขาดเก็บไม่ได้ |
+
+    ## RFD 6 §3.2 · พิสูจน์แล้ว ไม่ใช่อ้าง
+
+    ทุก pack ก่อนหน้าอ้างกฎ *ลบ projection แล้ว replay `chain_event`
+    ต้องได้ค่าเดิมเป๊ะ* แต่ไม่มีใครพิสูจน์
+
+    `f_replay_projections()` ทำจริง และ T20 ถึง T23 เทียบทุกคอลัมน์ทุกแถว
+    กับ snapshot ก่อนลบ · ไม่ใช่เทียบแค่จำนวนแถว
+
+    กฎที่ตามมาและสำคัญกว่าที่เห็น — **ตาราง projection ห้ามมีคอลัมน์ที่ค่า
+    มาจากเวลาที่ apply** · `now()` ในตารางพวกนี้ทำให้ replay ได้ค่าต่างทันที
+    `coupon_holding.as_of_time` จึงมาจาก `block_timestamp` เท่านั้น
+
+servers:
+  - url: https://ops.example.com
+    description: ภายในองค์กร
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: indexer
+    description: สถานะของ indexer
+  - name: reorg
+    description: ประวัติ reorg
+  - name: ops
+    description: งานที่ต้องสั่งด้วยมือ
+
+paths:
+  /internal/indexer/status:
+    get:
+      tags: [indexer]
+      summary: cursor อยู่ไหน ตามหลัง chain เท่าไร
+      operationId: getIndexerStatus
+      description: |
+        `lagBlocks` คือตัวที่ควรตั้ง alert · ไม่ใช่ `lastBlock`
+        เพราะ `lastBlock` เดินหน้าอยู่เสมอก็ยังตามไม่ทันได้
+
+        `leaseHeldBy` เป็น `null` แปลว่าไม่มี indexer ทำงานอยู่
+        ซึ่งเป็นภาวะที่ต้องรู้ทันที — ไม่มีใครอ่าน chain
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndexerStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /internal/indexer/pending:
+    get:
+      tags: [indexer]
+      summary: event ที่อ่านมาแล้วแต่ยังไม่ apply
+      operationId: getPendingEvents
+      description: |
+        คิวนี้ควรว่างเกือบตลอด · ยาวค้างแปลว่า projector ติดอะไรอยู่
+        มักเป็น event ที่อ้างของที่ไม่มีในฐานข้อมูล
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, items]
+                properties:
+                  count: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PendingEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /internal/reorgs:
+    get:
+      tags: [reorg]
+      summary: reorg ที่เคยเกิด
+      operationId: listReorgs
+      description: |
+        แถวที่ `outcome` เป็น `MANUAL_REVIEW` ต้องมีคนดูทุกแถว
+        มันหมายถึง reorg ที่ลึกกว่า `N` หรือกิน event ที่เคยบอกว่าจบแล้ว
+
+        ตารางนี้เป็น Group E ตาม FEAT-13 — ลบแล้ว replay ไม่ได้
+        เพราะมันบันทึกสิ่งที่ chain ไม่เคยบอก คือ
+        *เราเคยเชื่ออะไรไปแล้วและเปลี่ยนใจเมื่อไร*
+      parameters:
+        - name: outcome
+          in: query
+          schema: { $ref: '#/components/schemas/ReorgOutcome' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ReorgView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /internal/projections/replay:
+    post:
+      tags: [ops]
+      summary: ลบ projection แล้วสร้างใหม่จาก chain_event
+      operationId: replayProjections
+      description: |
+        เรียก `f_replay_projections()` · ลบ `coupon_holding` `point_balance`
+        ล้าง `applied_at` แล้ว apply ใหม่ทั้งหมดตามลำดับบน chain
+
+        **ไม่แตะ Group E** — `reorg_log` และตารางบันทึกการทำงานอื่นคงอยู่
+        และไม่แตะ `chain_event` นอกจาก `applied_at`
+
+        ### ใช้เมื่อไร
+
+        - แก้บั๊กใน `f_apply_event` แล้วต้องการให้ projection ตรงกับตรรกะใหม่
+        - สงสัยว่า projection เพี้ยนและอยากได้ค่าที่สืบจาก chain ได้
+        - หลัง reorg (ตัว `f_handle_reorg` เรียกให้เองอยู่แล้ว)
+
+        ### ใช้ไม่ได้เมื่อไร
+
+        ถ้าตรรกะใน `f_apply_event` เปลี่ยนไปจากตอนที่ apply ครั้งแรก
+        ผลที่ได้จะเป็น *ค่าตามตรรกะวันนี้* ไม่ใช่ *ค่าเดิม*
+        ซึ่งมักเป็นสิ่งที่ต้องการ แต่ไม่ใช่ทุกครั้ง · อ่าน README ก่อนกด
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: สร้างใหม่เสร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [eventsApplied, durationMs]
+                properties:
+                  eventsApplied: { type: integer }
+                  durationMs: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 8, maxLength: 255 }
+
+  schemas:
+    ChainEventName:
+      type: string
+      enum: [CouponTransfer, PointTransfer, CouponRedeemed, UNKNOWN]
+      description: |
+        `UNKNOWN` คือ `topic0` ที่ยังไม่รู้จัก · เก็บไว้แต่ไม่แตะ projection
+        และถูกทำเครื่องหมายว่า apply แล้วเพื่อไม่ให้ค้างในคิวตลอดไป
+
+    ReorgOutcome:
+      type: string
+      enum: [ROLLED_BACK, MANUAL_REVIEW]
+      description: |
+        เลือกเองไม่ได้ · `trg_reorg_outcome_matches_depth` บังคับว่า
+        ต้องตรงกับความลึกจริงเทียบกับ `N` ทั้งสองทิศทาง
+
+    IndexerStatus:
+      type: object
+      required: [lastBlock, lastBlockHash, chainHead, lagBlocks,
+                 leaseHeldBy, leaseUntil, finalityDepth, pendingEvents]
+      properties:
+        lastBlock: { type: integer, minimum: 0 }
+        lastBlockHash:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{64}$' }, { type: 'null' }]
+        chainHead:
+          type: integer
+          description: หัวของ chain ตอนนี้ · อ่านจาก node ไม่ใช่จากฐานข้อมูล
+        lagBlocks:
+          type: integer
+          description: ตัวที่ควรตั้ง alert
+        leaseHeldBy:
+          oneOf: [{ type: string }, { type: 'null' }]
+        leaseUntil:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        finalityDepth:
+          type: integer
+          description: '`N` ที่มีผลตอนนี้ · มาจาก `finality_config`'
+        pendingEvents: { type: integer }
+
+    PendingEvent:
+      type: object
+      required: [eventId, blockNumber, logIndex, eventName]
+      properties:
+        eventId: { type: string }
+        blockNumber: { type: integer }
+        logIndex: { type: integer }
+        eventName: { $ref: '#/components/schemas/ChainEventName' }
+        txHash: { type: string, pattern: '^0x[0-9a-f]{64}$' }
+
+    ReorgView:
+      type: object
+      required: [reorgId, detectedAt, forkBlock, oldTip, depth,
+                 finalityDepth, orphanedEvents, outcome]
+      properties:
+        reorgId: { type: string }
+        detectedAt: { type: string, format: date-time }
+        forkBlock: { type: integer }
+        oldTip: { type: integer }
+        depth:
+          type: integer
+          description: '`oldTip` − `forkBlock` + 1 · ตรวจด้วย CHECK'
+        finalityDepth: { type: integer }
+        orphanedEvents: { type: integer }
+        outcome: { $ref: '#/components/schemas/ReorgOutcome' }
+        note:
+          oneOf: [{ type: string }, { type: 'null' }]
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum: [UNAUTHORIZED, FORBIDDEN, REPLAY_IN_PROGRESS,
+                     NO_CURSOR, VALIDATION_FAILED]
+            message: { type: string }
+            requestId: { type: string }
+
+  responses:
+    Unauthorized:
+      description: token ไม่ถูกต้องหรือไม่ใช่ของฝ่าย ops
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        | code | เมื่อไร |
+        |---|---|
+        | `REPLAY_IN_PROGRESS` | มี replay ค้างอยู่ · รอให้จบก่อน |
+        | `NO_CURSOR` | ไม่มีแถว `indexer_cursor` · ยังไม่เคยเริ่มอ่าน |
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }

@@ -1,0 +1,292 @@
+// =====================================================================
+// FEAT-04 · Create Point Type · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อใน DB เป็น snake_case
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum OperationKind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+
+  @@map("operation_kind")
+}
+
+enum OperationStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+
+  @@map("operation_status")
+}
+
+enum StepStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+
+  @@map("step_status")
+}
+
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+
+  @@map("merchant_status")
+}
+
+/// สถานะในมุมของร้าน ไม่ใช่ของ chain
+/// FAILED แล้วชื่อและ symbol ถูกปล่อยคืน · partial unique index ครอบเฉพาะที่ไม่ใช่ FAILED
+enum PointTypeStatus {
+  REQUESTED
+  LIVE
+  FAILED
+  RETIRED
+
+  @@map("point_type_status")
+}
+
+enum ActorType {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+
+  @@map("actor_type")
+}
+
+// ------------------------------------------------------- ตัวตน (FEAT-01)
+model Merchant {
+  id        String         @id
+  name      String
+  status    MerchantStatus @default(PENDING)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  pointTypes PointType[]
+
+  @@map("merchant")
+}
+
+model Wallet {
+  id        String   @id
+  address   Bytes
+  keyRef    String   @map("key_ref")
+  ownerKind String   @map("owner_kind")
+  ownerId   String   @map("owner_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([address], map: "uq_wallet_address")
+  @@unique([ownerKind, ownerId], map: "uq_wallet_owner")
+  @@map("wallet")
+}
+
+model Signer {
+  address   Bytes  @id
+  keyRef    String @map("key_ref")
+  nextNonce BigInt @default(0) @map("next_nonce")
+  enabled   Boolean @default(true)
+
+  steps OperationStep[]
+
+  @@map("signer")
+}
+
+// ================================================== ฝั่งคำประกาศของร้าน
+/// **ไม่ใช่ projection** — ชื่อและ symbol มาจากร้าน ไม่ได้มาจาก chain
+/// ลบทิ้งแล้ว replay chain_event ใหม่ จะได้ชื่อกลับมาไม่ได้
+/// เขียนโดย api เท่านั้น
+///
+/// trigger trg_point_type_merchant_active กันไม่ให้ร้านที่ยังไม่ ACTIVE สร้างแถวนี้
+model PointType {
+  id         String          @id
+  merchantId String          @map("merchant_id")
+  name       String
+  /// ตัวใหญ่ล้วน 2-11 ตัว · CHECK บังคับรูปแบบไว้
+  symbol     String
+  /// RFD 14 · ใช้แปลงที่ชั้นแสดงผลเท่านั้น · ไม่ใช้ในการคำนวณ
+  decimals   Int             @db.SmallInt
+  status     PointTypeStatus @default(REQUESTED)
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  liveAt     DateTime?       @map("live_at") @db.Timestamptz(6)
+  retiredAt  DateTime?       @map("retired_at") @db.Timestamptz(6)
+
+  merchant Merchant        @relation(fields: [merchantId], references: [id])
+  chain    PointTypeChain?
+
+  @@index([merchantId, status], map: "ix_point_type_merchant")
+  @@map("point_type")
+}
+
+// ======================================================= ฝั่งผลจาก chain
+/// **projection แท้** — ทุกค่า derive จาก chain_event ได้
+/// ลบทิ้งทั้งตารางแล้ว replay ใหม่ ต้องได้ค่าเดิมเป๊ะ (RFD 6 §3.2)
+/// เขียนโดย projector เท่านั้น
+///
+/// trigger trg_point_chain_immutable กันไม่ให้แก้ค่าที่มาจาก chain หลังถูกเขียน
+model PointTypeChain {
+  pointTypeId     String   @id @map("point_type_id")
+  contractAddress Bytes    @map("contract_address")
+  deployedBlock   BigInt   @map("deployed_block")
+  deployedTxHash  Bytes    @map("deployed_tx_hash")
+  /// RFD 10 · สามค่านี้ทำให้คำนวณวันหมดอายุของ point แต่ละก้อนได้
+  /// โดยไม่ต้องมี event ตอนหมดอายุ และ rebuild แล้วได้ค่าเดิมเสมอ
+  genesisAt       DateTime @map("genesis_at") @db.Timestamptz(6)
+  epochSeconds    Int      @map("epoch_seconds")
+  validityEpochs  Int      @map("validity_epochs")
+  appliedAt       DateTime @default(now()) @map("applied_at") @db.Timestamptz(6)
+
+  pointType PointType @relation(fields: [pointTypeId], references: [id])
+
+  @@unique([contractAddress], map: "uq_point_chain_address")
+  @@map("point_type_chain")
+}
+
+// --------------------------------------------- Group B · แกน write path
+model IdempotencyKey {
+  id             String    @id
+  scope          String
+  key            String
+  fingerprint    Bytes
+  operationId    String?   @map("operation_id")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+model Operation {
+  id          String          @id
+  actorScope  String          @map("actor_scope")
+  kind        OperationKind
+  status      OperationStatus @default(PENDING)
+  /// pointTypeId · partial unique index กันสั่ง deploy ซ้อน
+  subjectId   String?         @map("subject_id")
+  payload     Json
+  errorNote   String?         @map("error_note")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  finalizedAt DateTime?       @map("finalized_at") @db.Timestamptz(6)
+
+  steps           OperationStep[]
+  outbox          Outbox[]
+  events          OperationEvent[]
+  idempotencyKeys IdempotencyKey[]
+  chainEvents     ChainEvent[]
+
+  @@index([createdAt], map: "ix_operation_open")
+  @@map("operation")
+}
+
+model OperationStep {
+  id            String     @id
+  operationId   String     @map("operation_id")
+  stepIndex     Int        @map("step_index")
+  name          String
+  signerAddress Bytes?     @map("signer_address")
+  nonce         BigInt?
+  /// RFD 2 R2 · ต้อง COMMIT ก่อน broadcast เสมอ
+  rawTx         Bytes?     @map("raw_tx")
+  txHash        Bytes?     @map("tx_hash")
+  status        StepStatus @default(PENDING)
+  submittedAt   DateTime?  @map("submitted_at") @db.Timestamptz(6)
+  confirmedAt   DateTime?  @map("confirmed_at") @db.Timestamptz(6)
+  finalizedAt   DateTime?  @map("finalized_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  signer    Signer?   @relation(fields: [signerAddress], references: [address])
+
+  @@unique([operationId, stepIndex], map: "uq_step_order")
+  @@unique([txHash], map: "uq_step_txhash")
+  @@unique([signerAddress, nonce], map: "uq_signer_nonce")
+  @@map("operation_step")
+}
+
+model Outbox {
+  id          String    @id
+  operationId String    @map("operation_id")
+  /// ต้องมีเวอร์ชันต่อท้าย เช่น point.type.create.v1 (RFD 7 D9)
+  topic       String
+  payload     Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_outbox_pending")
+  @@map("outbox")
+}
+
+model OperationEvent {
+  id          String           @id
+  operationId String           @map("operation_id")
+  fromStatus  OperationStatus? @map("from_status")
+  toStatus    OperationStatus  @map("to_status")
+  actor       ActorType        @default(SYSTEM)
+  txHash      Bytes?           @map("tx_hash")
+  metadata    Json             @default("{}")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@map("operation_event")
+}
+
+// -------------------------------------------- Group C · ฝั่งอ่าน chain
+model ChainEvent {
+  id             String    @id
+  blockNumber    BigInt    @map("block_number")
+  blockHash      Bytes     @map("block_hash")
+  txHash         Bytes     @map("tx_hash")
+  logIndex       Int       @map("log_index")
+  address        Bytes
+  topic0         Bytes
+  topics         Json      @default("[]")
+  data           Bytes
+  blockTimestamp DateTime  @map("block_timestamp") @db.Timestamptz(6)
+  operationId    String?   @map("operation_id")
+  orphanedAt     DateTime? @map("orphaned_at") @db.Timestamptz(6)
+  appliedAt      DateTime? @map("applied_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([txHash, logIndex], map: "uq_chain_event")
+  @@map("chain_event")
+}
+
+model IndexerCursor {
+  contractAddress Bytes    @id @map("contract_address")
+  lastBlock       BigInt   @map("last_block")
+  lastBlockHash   Bytes?   @map("last_block_hash")
+  updatedAt       DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("indexer_cursor")
+}

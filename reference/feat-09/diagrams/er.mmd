@@ -1,0 +1,126 @@
+erDiagram
+    merchant ||--o{ coupon_type : "ออก"
+    coupon_type ||--o{ coupon_code : "มีใบ"
+    coupon_type ||--o{ listing : "ประเภทที่ขาย"
+
+    listing ||--o{ listing_item : "ประกอบด้วย"
+    coupon_code ||--o{ listing_item : "ถูกใส่ใน"
+    listing ||--o| listing_chain : "ผลจาก chain"
+
+    operation ||--o{ operation_step : "สองขั้น"
+    operation ||--o{ outbox : "commit พร้อมกัน"
+    operation ||--o{ reservation : "ของที่กันไว้"
+    operation ||--o{ operation_event : "ทุก transition"
+    operation ||--o| idempotency_key : "คำตอบที่เก็บไว้"
+    operation ||--o{ chain_event : "event ที่ตรงกัน"
+    signer ||--o{ operation_step : "เซ็น"
+
+    merchant {
+        text id PK
+        merchant_status status
+    }
+
+    customer {
+        text id PK
+    }
+
+    coupon_type {
+        text id PK
+        text merchant_id FK
+        numeric face_value "78 0"
+        timestamptz expires_at
+    }
+
+    coupon_code {
+        text id PK
+        coupon_code_state state "ถอดแล้วยัง HELD ไม่เปลี่ยน"
+        holder_kind holder_kind "ยังเป็นร้านเดิม"
+        text holder_id
+    }
+
+    listing {
+        text id PK
+        holder_kind seller_kind "trg_delist_admissible เทียบกับ actor_scope"
+        text seller_id "F5 · เจ้าของตรวจที่นี่ ไม่ใช่ที่โค้ด"
+        numeric unit_price "78 0"
+        integer quantity
+        listing_status status "ถอดได้เฉพาะ ACTIVE"
+        timestamptz active_at "เติมอัตโนมัติ"
+        timestamptz closed_at "เติมอัตโนมัติเมื่อปิด"
+    }
+
+    listing_item {
+        text id PK
+        text listing_id FK
+        text coupon_code_id FK "ใบที่ระบุเจาะจง ไม่ใช่จำนวน"
+    }
+
+    listing_chain {
+        text listing_id PK
+        bytea contract_address "แก้ไม่ได้"
+        numeric chain_listing_id "แก้ไม่ได้"
+        bigint closed_block
+        bytea closed_tx_hash
+        listing_close_reason close_reason "CANCELLED หรือ SOLD · ตั้งแล้วเปลี่ยนไม่ได้"
+    }
+
+    idempotency_key {
+        text id PK
+        text scope "UNIQUE กับ key"
+        text key
+        bytea fingerprint "sha256 ของ listingId · ห้าม HMAC"
+        integer response_status
+        jsonb response_body
+    }
+
+    operation {
+        text id PK
+        text actor_scope "มาจาก token ไม่ใช่จาก body"
+        operation_kind kind "LISTING_DELETE"
+        operation_status status "uq_listing_inflight กันงานซ้อน"
+        text subject_id "listing ที่จะถอด"
+        text error_note "CHAIN_REVERTED = แพ้คนซื้อ"
+    }
+
+    operation_step {
+        text id PK
+        integer step_index "1 cancelListing · 2 releaseFromVault"
+        text name
+        bytea raw_tx "R2 · commit ก่อน broadcast"
+        bytea tx_hash "UNIQUE"
+        bigint nonce "UNIQUE กับ signer"
+        step_status status "trg_step_order_gate บังคับลำดับ"
+    }
+
+    reservation {
+        text id PK
+        reservation_subject subject_type "COUPON_UNIT หรือ LISTING"
+        text subject_id
+        timestamptz released_at "ปล่อยได้เมื่อรายการปิดแล้ว"
+    }
+
+    outbox {
+        text id PK
+        text topic "listing.delete.v1"
+        timestamptz sent_at "NULL = ยังไม่มีใครหยิบ"
+    }
+
+    operation_event {
+        text id PK
+        operation_status to_status
+        actor_type actor "PLATFORM_ADMIN ถ้า admin สั่ง"
+        jsonb metadata
+    }
+
+    signer {
+        bytea address PK
+        text key_ref "KMS · ไม่มี private key ในฐานข้อมูล"
+        bigint next_nonce
+    }
+
+    chain_event {
+        text id PK
+        bytea tx_hash "UNIQUE กับ log_index"
+        integer log_index
+        bytea block_hash "เทียบซ้ำ ไม่ใช่นับความลึก"
+    }

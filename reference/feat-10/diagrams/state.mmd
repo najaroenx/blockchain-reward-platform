@@ -1,0 +1,32 @@
+stateDiagram-v2
+    direction TB
+
+    state "เงินถูกกันไว้ ไม่ได้ย้าย" as note_hold
+
+    [*] --> PENDING : รับคำขอ · จอง THB สำเร็จ
+
+    note right of PENDING
+        เงินยังอยู่ในบัญชีผู้ซื้อ
+        ยอดที่ใช้ได้ลดลงเท่านั้น
+        ไม่มี ledger entry ใดๆ ในขั้นนี้
+    end note
+
+    PENDING --> SETTLED : executePurchase FINALIZED
+    PENDING --> FAILED : tx revert
+
+    note right of SETTLED
+        ledger 3 แถว รวมได้ศูนย์
+        ลบ total · บวก net · บวก fee
+        ยอดทั้งสามบัญชีเปลี่ยนพร้อมกัน
+        คูปองย้ายไปผู้ซื้อ · listing เป็น SOLD
+    end note
+
+    note left of FAILED
+        ปล่อยการจองคืน จบ
+        ไม่มี ledger entry เลย
+        เพราะเงินไม่เคยถูกย้าย
+        ทางกู้คืนที่ว่างเปล่าคือทางที่ไม่พัง
+    end note
+
+    SETTLED --> [*]
+    FAILED --> [*]

@@ -1,0 +1,86 @@
+sequenceDiagram
+    autonumber
+    actor Cus as ลูกค้า
+    participant Api as api
+    participant Psp as ผู้ให้บริการชำระเงิน
+    participant Db as postgres
+    participant Wrk as worker
+    participant Ch as chain
+    participant Idx as indexer
+
+    Note over Cus,Idx: เงินบาทจริงเข้ามาก่อน · THB เกิดขึ้นทีหลัง
+
+    Cus->>Api: POST /v1/deposits · amountSatang
+    Api->>Db: BEGIN
+    Note over Api,Db: R1 · INSERT idempotency_key ON CONFLICT DO NOTHING
+    Api->>Db: INSERT thb_deposit · PENDING_PAYMENT
+    Note right of Db: trg_deposit_amount_exact<br/>สตางค์ x 10^16 = base units<br/>ไม่เชื่อโค้ดฝ่ายเดียว
+    Api->>Db: COMMIT
+    Api-->>Cus: 201 paymentUrl · ยังไม่มี THB เกิดขึ้น
+
+    Cus->>Psp: จ่ายเงินบาทจริง
+
+    Note over Cus,Idx: ---- ผู้ให้บริการแจ้งผล ----
+
+    Psp->>Api: POST /v1/webhooks/psp/omise<br/>X-Signature · body ดิบ
+
+    rect rgb(252,246,232)
+        Note over Api,Db: ลำดับนี้สำคัญ
+        Note right of Api: 1 ตรวจ HMAC จาก body ดิบ ก่อน parse<br/>parse แล้ว serialize ใหม่ = byte คนละชุด<br/>เทียบด้วย timingSafeEqual
+        Api->>Db: INSERT psp_webhook (เขียนทั้งที่ลายเซ็นไม่ผ่าน)
+        Note right of Db: provider_event_id UNIQUE<br/>นี่คือ idempotency ตัวจริง<br/>ผู้ให้บริการเลือกคีย์ ไม่ใช่เรา<br/>ix_psp_unprocessed กรองแถวที่ไม่ผ่านออกจากคิว
+    end
+
+    alt ลายเซ็นผ่าน และยอดตรง
+        Api->>Db: UPDATE thb_deposit CONFIRMED
+        Api-->>Psp: 200 received
+    else ยอดไม่ตรงกับที่บันทึกไว้
+        Note right of Api: ไม่แก้ยอดตาม<br/>บันทึกว่าไม่ตรงแล้วรอคนตรวจ<br/>ยืนยันแล้วแก้ยอดไม่ได้อยู่แล้ว
+        Api-->>Psp: 200 received
+    else ลายเซ็นไม่ผ่าน
+        Note right of Db: แถวยังถูกบันทึก<br/>ทิ้งเงียบๆ แปลว่ามีคนลองยิงแล้วไม่มีใครรู้
+        Api-->>Psp: 401
+    end
+
+    Note over Cus,Idx: ---- สั่ง mint ----
+
+    Wrk->>Db: หาการฝากที่ CONFIRMED แต่ยังไม่ mint
+    Wrk->>Db: INSERT operation THB_MINT
+    Wrk->>Db: INSERT thb_mint
+
+    rect rgb(252,240,238)
+        Note over Wrk,Db: F4 · จุดที่ระบบเดิมเสก THB ขึ้นมา
+        Note right of Db: trg_mint_requires_confirmed_deposit<br/>1 การฝากต้อง CONFIRMED<br/>2 ยอดต้องตรงพอดี<br/>3 ปลายทางต้องเป็นเจ้าของการฝาก<br/><br/>primary key บน deposit_id<br/>mint ซ้ำไม่ได้
+    end
+
+    Wrk->>Db: UPDATE step 1 SET raw_tx · COMMIT
+    Note right of Wrk: R2 · raw_tx commit ก่อน broadcast<br/>mint = หนึ่ง step ไม่ใช่สองหรือสาม
+    Wrk->>Ch: mintTHB(to, amount)
+
+    Ch-->>Idx: event Transfer จาก address ศูนย์
+    Idx->>Db: INSERT chain_event
+
+    rect rgb(238,248,240)
+        Note over Idx,Db: ledger สองแถว รวมได้ศูนย์
+        Idx->>Db: INSERT ledger_entry · ปลายทาง +amount
+        Idx->>Db: INSERT ledger_entry · ISSUANCE −amount
+        Note right of Db: trg_issuance_only_from_mint<br/>แถว ISSUANCE ต้องมาจาก kind = THB_MINT<br/>ที่อื่นแตะไม่ได้เลย
+        Idx->>Db: UPDATE thb_balance ทั้งสองบัญชี
+        Idx->>Db: UPDATE thb_deposit MINTED
+        Idx->>Db: COMMIT
+        Note right of Db: ตอน COMMIT<br/>trg_ledger_balanced · รวมได้ศูนย์ไหม<br/>trg_balance_matches_ledger · ยอดตรง ledger ไหม
+    end
+
+    Note over Cus,Idx: ---- ถูกตีกลับทีหลัง ----
+
+    Psp->>Api: charge.reverse
+    Api->>Db: อ่าน f_available_thb ของเจ้าของ
+
+    alt ยอดที่ใช้ได้ยังพอ
+        Api->>Db: INSERT deposit_reversal · BURNED
+        Api->>Db: ledger สองแถว ทิศทางกลับกัน
+        Note right of Db: เผา THB คืน · ledger ยังสมดุล
+    else ยอดไม่พอ · ใช้ซื้อของไปแล้ว
+        Api->>Db: INSERT deposit_reversal · MANUAL_REVIEW
+        Note right of Db: ไม่แตะยอดเลย · ไม่แต่งตัวเลข<br/>trg_reversal_outcome_matches_balance<br/>ปฏิเสธถ้าอ้างผลลัพธ์ไม่ตรงกับยอดจริง<br/>ทั้งสองทิศทาง
+    end

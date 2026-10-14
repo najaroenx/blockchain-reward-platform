@@ -1,0 +1,318 @@
+// =====================================================================
+// FEAT-14 · Indexer + Projector · schema.prisma
+//
+// ไฟล์นี้สะท้อน db/migration.sql · migration เป็นต้นฉบับ ไม่ใช่ไฟล์นี้
+//
+// pack นี้พึ่ง migration มากกว่าทุก pack ก่อนหน้า เพราะตรรกะหลัก
+// อยู่ในฟังก์ชันของฐานข้อมูล ไม่ใช่ในโค้ด TypeScript
+//
+//   f_apply_event           แปลง event หนึ่งแถวเป็นการเปลี่ยน projection
+//   f_apply_pending         apply ตามลำดับ (block_number, log_index)
+//   f_replay_projections    RFD 6 §3.2 ในรูปของฟังก์ชันที่รันได้
+//   f_handle_reorg          orphan แล้ว replay · ไม่ย้อนทีละ event
+//   f_mark_finalized        ทำเครื่องหมายว่าลึกพอแล้ว
+//   f_finality_depth        N ที่มีผลตามเวลาที่ถาม
+//
+// ที่อยู่ในฐานข้อมูลโดยตั้งใจ เพราะการ replay ต้องใช้ตรรกะเดียวกับ
+// การ apply ครั้งแรกเป๊ะ · ถ้าตรรกะอยู่ในโค้ด การ replay จะต้องรันโค้ด
+// รุ่นเดียวกับที่ apply ครั้งแรก ซึ่งเป็นไปไม่ได้เมื่อเวลาผ่านไป
+//
+// สิ่งที่หายไปถ้าให้ Prisma generate migration เอง — ทุกข้อข้างบน
+// บวก trigger ห้าตัว และ partial unique index uq_block_live
+//
+// วิธีใช้
+//   1  psql -d <db> -f db/migration.sql
+//   2  npx prisma db pull
+//   3  npx prisma generate
+//   4  ลบโฟลเดอร์ typings/ ทิ้ง
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------ enum
+enum operation_kind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+}
+
+enum operation_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+}
+
+enum holder_kind {
+  MERCHANT
+  CUSTOMER
+}
+
+enum merchant_status {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum coupon_code_state {
+  ISSUED
+  HELD
+  REDEEMED
+  EXPIRED
+  VOIDED
+}
+
+/// ชนิดที่ indexer รู้จักถอดรหัส
+/// UNKNOWN ถูกเก็บแต่ไม่แตะ projection · และถูกทำเครื่องหมายว่า apply แล้ว
+/// เพื่อไม่ให้ค้างในคิวตลอดไป
+enum chain_event_name {
+  CouponTransfer
+  PointTransfer
+  CouponRedeemed
+  UNKNOWN
+}
+
+/// เลือกเองไม่ได้ · trg_reorg_outcome_matches_depth บังคับทั้งสองทิศทาง
+enum reorg_outcome {
+  ROLLED_BACK
+  MANUAL_REVIEW
+}
+
+// ------------------------------------------------------------ ตัวตน
+model merchant {
+  id         String          @id
+  name       String
+  status     merchant_status @default(PENDING)
+  created_at DateTime        @default(now()) @db.Timestamptz(6)
+
+  point_types  point_type[]
+  coupon_types coupon_type[]
+
+  @@map("merchant")
+}
+
+model customer {
+  id         String   @id
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("customer")
+}
+
+model point_type {
+  id          String @id
+  merchant_id String
+  name        String
+
+  merchant merchant        @relation(fields: [merchant_id], references: [id])
+  balances point_balance[]
+
+  @@map("point_type")
+}
+
+model coupon_type {
+  id          String @id
+  merchant_id String
+  name        String
+
+  merchant merchant      @relation(fields: [merchant_id], references: [id])
+  codes    coupon_code[]
+
+  @@map("coupon_type")
+}
+
+/// state เป็น projection ด้วย · CouponRedeemed เขียนทับมัน
+/// f_replay_projections จึงต้องย้อนค่านี้กลับไป ISSUED ก่อน apply ใหม่
+/// ข้อนี้พลาดได้ง่าย เพราะตารางนี้ไม่ได้ชื่อว่าเป็น projection (T22 ตรวจ)
+model coupon_code {
+  id             String            @id
+  coupon_type_id String
+  /// chain รู้จักคูปองด้วย code_ref ไม่ใช่ด้วย id (RFD 12)
+  code_ref       Bytes             @unique(map: "uq_code_ref")
+  state          coupon_code_state @default(ISSUED)
+
+  coupon_type coupon_type     @relation(fields: [coupon_type_id], references: [id])
+  holding     coupon_holding?
+
+  @@map("coupon_code")
+}
+
+model operation {
+  id           String           @id
+  actor_scope  String
+  kind         operation_kind
+  status       operation_status @default(PENDING)
+  payload      Json             @default("{}")
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  finalized_at DateTime?        @db.Timestamptz(6)
+
+  chain_events chain_event[]
+
+  @@map("operation")
+}
+
+// ================================================= Group C · ฝั่งอ่าน chain
+/// คำถามที่ RFD 1 §10 ค้างไว้ · ค่า N
+///
+/// เก็บเป็นตารางที่มี effective_from เพราะ
+///   ค่านี้ขึ้นกับ chain ที่ใช้ และเปลี่ยนค่าวันนี้ต้องไม่ทำให้ event
+///   ที่เคยถือว่า final กลายเป็นไม่ final · f_finality_depth(ts) ตอบตามเวลา
+///
+/// pack นี้ไม่ได้ตอบว่า 12 ถูกหรือผิด · ตอบแค่ว่าค่านี้อยู่ที่เดียว
+/// และเปลี่ยนแล้วไม่ทำลายอดีต
+model finality_config {
+  id             String   @id
+  depth_blocks   Int
+  effective_from DateTime @unique(map: "uq_finality_effective") @db.Timestamptz(6)
+  note           String?
+
+  @@map("finality_config")
+}
+
+/// L8 ข้อแรก · indexer รัน instance เดียว
+///
+/// แถวเดียวเท่านั้น (CHECK id = 'main') และมี lease
+///   pg_advisory_lock  กันสอง process พร้อมกัน
+///   lease_until       กัน process ที่ยังไม่ตายแต่หยุดตอบสนอง
+///                     ซึ่ง advisory lock ดักไม่ได้เพราะ connection ยังอยู่
+///
+/// trg_cursor_needs_lease บังคับว่าขยับได้เฉพาะคนถือ lease ที่ยังไม่หมดอายุ
+/// และห้ามเปลี่ยนเจ้าของ lease พร้อมกับขยับในสเตตเมนต์เดียว
+model indexer_cursor {
+  id              String    @id
+  last_block      BigInt
+  last_block_hash Bytes?
+  lease_owner     String?
+  lease_until     DateTime? @db.Timestamptz(6)
+  updated_at      DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("indexer_cursor")
+}
+
+/// RFD 5 · reorg ตรวจด้วยการเทียบ block_hash ไม่ใช่นับความลึก
+///
+/// primary key เป็น block_hash ไม่ใช่ block_number
+/// ตัวตนของบล็อกคือ hash ของมัน · ความสูงไม่ใช่ตัวตน
+/// หลัง reorg จะมีบล็อกสองใบที่ความสูงเดียวกัน ใบหนึ่ง orphan
+/// ถ้าความสูงเป็น primary key เรื่องนั้นเป็นไปไม่ได้ และ reorg
+/// จะเก็บประวัติไม่ได้เลย — ต้องลบของเก่าทิ้ง
+///
+/// trg_block_links_to_parent ทำให้สายโซ่ที่ขาดเก็บลงฐานข้อมูลไม่ได้เลย
+/// ไม่ใช่เก็บได้แล้วค่อยมีใครมาตรวจทีหลัง
+model raw_block {
+  block_hash   Bytes     @id
+  block_number BigInt
+  parent_hash  Bytes
+  timestamp    DateTime  @db.Timestamptz(6)
+  tx_count     Int       @default(0)
+  orphaned_at  DateTime? @db.Timestamptz(6)
+  read_at      DateTime  @default(now()) @db.Timestamptz(6)
+
+  events chain_event[]
+
+  @@index([block_number], map: "ix_block_number")
+  @@map("raw_block")
+}
+
+/// UNIQUE (tx_hash, log_index) ทำให้อ่านช่วงเดิมซ้ำปลอดภัย
+/// ซึ่งจำเป็น เพราะ indexer ที่ restart จะอ่านทับช่วงเดิมเสมอ
+///
+/// data เป็นของจริงที่ได้จาก chain · args เป็นผลของการถอดรหัส
+/// ถ้าสองค่าไม่ตรงกัน data ถูก · args เป็นแคชที่สร้างใหม่ได้
+///
+/// trg_event_within_cursor (DEFERRED) · L8 ข้อสอง
+///   ไม่มี event ที่ block_number เกิน cursor ตอน COMMIT
+model chain_event {
+  id              String           @id
+  block_number    BigInt
+  block_hash      Bytes
+  tx_hash         Bytes
+  log_index       Int
+  address         Bytes
+  topic0          Bytes
+  topics          Json             @default("[]")
+  data            Bytes
+  block_timestamp DateTime         @db.Timestamptz(6)
+  event_name      chain_event_name @default(UNKNOWN)
+  args            Json?
+  operation_id    String?
+  applied_at      DateTime?        @db.Timestamptz(6)
+  orphaned_at     DateTime?        @db.Timestamptz(6)
+  /// เขียนเมื่อ cursor ผ่านไปลึกกว่า N · แล้ว orphan ไม่ได้อีก
+  finalized_at    DateTime?        @db.Timestamptz(6)
+
+  block     raw_block  @relation(fields: [block_hash], references: [block_hash])
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([tx_hash, log_index], map: "uq_chain_event")
+  @@index([block_number], map: "ix_event_by_block")
+  @@map("chain_event")
+}
+
+// ==================================================== Group D · projection
+/// RFD 6 §3.2 · ลบทิ้งแล้ว replay chain_event ใหม่ ต้องได้ค่าเดิมเป๊ะ
+///
+/// as_of_time มาจาก block_timestamp เท่านั้น ห้ามมาจาก now()
+/// ถ้าใช้ now() การ replay จะได้ค่าต่างทันที และ T20 T23 T25 จะ FAIL
+/// (ทดลองแล้วด้วยการแก้ให้ผิดจริง · ดู README)
+model coupon_holding {
+  coupon_code_id String      @id
+  holder_kind    holder_kind
+  holder_id      String
+  as_of_block    BigInt
+  as_of_time     DateTime    @db.Timestamptz(6)
+
+  coupon_code coupon_code @relation(fields: [coupon_code_id], references: [id])
+
+  @@index([holder_kind, holder_id], map: "ix_holding_holder")
+  @@map("coupon_holding")
+}
+
+model point_balance {
+  point_type_id String      @db.Text
+  holder_kind   holder_kind
+  holder_id     String
+  amount        Decimal     @db.Decimal(78, 0)
+  as_of_block   BigInt
+
+  point_type point_type @relation(fields: [point_type_id], references: [id])
+
+  @@id([point_type_id, holder_kind, holder_id])
+  @@map("point_balance")
+}
+
+// ======================================================= Group E · บันทึก
+/// ลบแล้ว replay ไม่ได้ · บันทึกสิ่งที่ chain ไม่เคยบอก
+/// คือ "เราเคยเชื่ออะไรไปแล้วและเปลี่ยนใจเมื่อไร"
+///
+/// ห้ามใส่ตารางนี้ในสคริปต์ที่ลบ Group D เพื่อสร้างใหม่
+model reorg_log {
+  id              String        @id
+  detected_at     DateTime      @default(now()) @db.Timestamptz(6)
+  fork_block      BigInt
+  old_tip         BigInt
+  depth           Int
+  finality_depth  Int
+  orphaned_events Int
+  outcome         reorg_outcome
+  note            String?
+
+  @@map("reorg_log")
+}

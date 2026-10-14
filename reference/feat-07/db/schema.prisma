@@ -1,0 +1,328 @@
+// =====================================================================
+// FEAT-07 · Create Coupon Type + Issue Codes · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อใน DB เป็น snake_case
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum OperationKind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+
+  @@map("operation_kind")
+}
+
+enum OperationStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+
+  @@map("operation_status")
+}
+
+enum StepStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+
+  @@map("step_status")
+}
+
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+
+  @@map("merchant_status")
+}
+
+enum CouponTypeStatus {
+  REQUESTED
+  LIVE
+  FAILED
+  RETIRED
+
+  @@map("coupon_type_status")
+}
+
+/// RFD 11 §3.2 · VOIDED ปล่อยโควตาคืนให้ออกใบใหม่ได้
+enum CouponCodeState {
+  ISSUED
+  HELD
+  REDEEMED
+  EXPIRED
+  VOIDED
+
+  @@map("coupon_code_state")
+}
+
+enum HolderKind {
+  MERCHANT
+  CUSTOMER
+
+  @@map("holder_kind")
+}
+
+enum ActorType {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+
+  @@map("actor_type")
+}
+
+// ------------------------------------------------------- ตัวตน (FEAT-01)
+model Merchant {
+  id        String         @id
+  name      String
+  status    MerchantStatus @default(PENDING)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  couponTypes CouponType[]
+
+  @@map("merchant")
+}
+
+model Signer {
+  address   Bytes   @id
+  keyRef    String  @map("key_ref")
+  nextNonce BigInt  @default(0) @map("next_nonce")
+  enabled   Boolean @default(true)
+
+  steps OperationStep[]
+
+  @@map("signer")
+}
+
+// ================================================= ประเภทคูปอง · ฝั่งร้าน
+/// ไม่ใช่ projection · ชื่อและเงื่อนไขมาจากร้าน ไม่ได้มาจาก chain
+/// trigger trg_coupon_type_merchant_active กันร้านที่ยังไม่ ACTIVE
+model CouponType {
+  id          String           @id
+  merchantId  String           @map("merchant_id")
+  name        String
+  /// RFD 14 · base units ของ THB
+  faceValue   Decimal          @map("face_value") @db.Decimal(78, 0)
+  /// ประกาศตอนสร้างแล้วเปลี่ยนไม่ได้ · trigger trg_issue_within_supply ใช้ค่านี้
+  totalSupply Int              @map("total_supply")
+  status      CouponTypeStatus @default(REQUESTED)
+  expiresAt   DateTime         @map("expires_at") @db.Timestamptz(6)
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  liveAt      DateTime?        @map("live_at") @db.Timestamptz(6)
+
+  merchant Merchant          @relation(fields: [merchantId], references: [id])
+  chain    CouponTypeChain?
+  codes    CouponCode[]
+  batches  IssueBatch[]
+
+  @@index([merchantId, status], map: "ix_coupon_type_merchant")
+  @@map("coupon_type")
+}
+
+// ================================================ ประเภทคูปอง · ฝั่ง chain
+/// projection แท้ · rebuild จาก chain_event ได้เสมอ (RFD 6 §3.2)
+/// trigger trg_coupon_chain_immutable กันไม่ให้แก้ค่าหลังเขียน
+model CouponTypeChain {
+  couponTypeId    String   @id @map("coupon_type_id")
+  contractAddress Bytes    @map("contract_address")
+  chainTypeId     Decimal  @map("chain_type_id") @db.Decimal(78, 0)
+  deployedBlock   BigInt   @map("deployed_block")
+  deployedTxHash  Bytes    @map("deployed_tx_hash")
+  appliedAt       DateTime @default(now()) @map("applied_at") @db.Timestamptz(6)
+
+  couponType CouponType @relation(fields: [couponTypeId], references: [id])
+
+  @@unique([contractAddress, chainTypeId], map: "uq_coupon_chain")
+  @@map("coupon_type_chain")
+}
+
+// ========================================================= รหัสคูปอง
+/// RFD 11 §3.3 · plaintext ไม่เคยอยู่ในตารางนี้ · พิสูจน์ด้วย T10
+///
+///   codeHash = sha256(plaintext)  ใช้ค้นหาตอนลูกค้ายื่นรหัสมา
+///   codeRef  = sha256(id)         ส่งขึ้น chain
+///
+/// trigger trg_code_ref_derived บังคับว่า codeRef ต้องเท่ากับ sha256(id) เสมอ
+/// ทำให้ projector คำนวณค่านี้เองได้โดยไม่ต้องรู้ plaintext และไม่ต้องอ่านตารางนี้
+///
+/// trigger trg_issue_within_supply กันไม่ให้ออกเกิน totalSupply
+model CouponCode {
+  id           String          @id
+  couponTypeId String          @map("coupon_type_id")
+  codeHash     Bytes           @map("code_hash")
+  codeRef      Bytes           @map("code_ref")
+  state        CouponCodeState @default(ISSUED)
+  holderKind   HolderKind?     @map("holder_kind")
+  holderId     String?         @map("holder_id")
+  issueBatchId String?         @map("issue_batch_id")
+  issuedAt     DateTime        @default(now()) @map("issued_at") @db.Timestamptz(6)
+  heldAt       DateTime?       @map("held_at") @db.Timestamptz(6)
+  redeemedAt   DateTime?       @map("redeemed_at") @db.Timestamptz(6)
+
+  couponType CouponType  @relation(fields: [couponTypeId], references: [id])
+  batch      IssueBatch? @relation(fields: [issueBatchId], references: [id])
+
+  @@unique([codeHash], map: "uq_code_hash")
+  @@unique([codeRef], map: "uq_code_ref")
+  @@index([couponTypeId, state], map: "ix_code_type_state")
+  @@index([holderKind, holderId], map: "ix_code_holder")
+  @@map("coupon_code")
+}
+
+/// หนึ่งคำขอออกรหัส = หนึ่งชุด
+model IssueBatch {
+  id           String   @id
+  couponTypeId String   @map("coupon_type_id")
+  operationId  String?  @map("operation_id")
+  quantity     Int
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  couponType CouponType   @relation(fields: [couponTypeId], references: [id])
+  operation  Operation?   @relation(fields: [operationId], references: [id])
+  codes      CouponCode[]
+
+  @@index([couponTypeId], map: "ix_batch_type")
+  @@map("issue_batch")
+}
+
+// --------------------------------------------- Group B · แกน write path
+model IdempotencyKey {
+  id             String    @id
+  scope          String
+  key            String
+  fingerprint    Bytes
+  operationId    String?   @map("operation_id")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+model Operation {
+  id          String          @id
+  actorScope  String          @map("actor_scope")
+  kind        OperationKind
+  status      OperationStatus @default(PENDING)
+  subjectId   String?         @map("subject_id")
+  payload     Json
+  errorNote   String?         @map("error_note")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  finalizedAt DateTime?       @map("finalized_at") @db.Timestamptz(6)
+
+  steps           OperationStep[]
+  outbox          Outbox[]
+  events          OperationEvent[]
+  idempotencyKeys IdempotencyKey[]
+  batches         IssueBatch[]
+  chainEvents     ChainEvent[]
+
+  @@index([createdAt], map: "ix_operation_open")
+  @@map("operation")
+}
+
+model OperationStep {
+  id            String     @id
+  operationId   String     @map("operation_id")
+  stepIndex     Int        @map("step_index")
+  name          String
+  /// จำนวนรหัสที่ mint ใน tx นี้ · เกิน 500 แล้ว gas ต่อ tx เกิน block limit
+  mintCount     Int        @default(1) @map("mint_count")
+  signerAddress Bytes?     @map("signer_address")
+  nonce         BigInt?
+  /// RFD 2 R2 · ต้อง COMMIT ก่อน broadcast เสมอ
+  rawTx         Bytes?     @map("raw_tx")
+  txHash        Bytes?     @map("tx_hash")
+  status        StepStatus @default(PENDING)
+  submittedAt   DateTime?  @map("submitted_at") @db.Timestamptz(6)
+  confirmedAt   DateTime?  @map("confirmed_at") @db.Timestamptz(6)
+  finalizedAt   DateTime?  @map("finalized_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  signer    Signer?   @relation(fields: [signerAddress], references: [address])
+
+  @@unique([operationId, stepIndex], map: "uq_step_order")
+  @@unique([txHash], map: "uq_step_txhash")
+  @@unique([signerAddress, nonce], map: "uq_signer_nonce")
+  @@map("operation_step")
+}
+
+model Outbox {
+  id          String    @id
+  operationId String    @map("operation_id")
+  topic       String
+  payload     Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_outbox_pending")
+  @@map("outbox")
+}
+
+model OperationEvent {
+  id          String           @id
+  operationId String           @map("operation_id")
+  fromStatus  OperationStatus? @map("from_status")
+  toStatus    OperationStatus  @map("to_status")
+  actor       ActorType        @default(SYSTEM)
+  txHash      Bytes?           @map("tx_hash")
+  metadata    Json             @default("{}")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@map("operation_event")
+}
+
+// -------------------------------------------- Group C · ฝั่งอ่าน chain
+model ChainEvent {
+  id             String    @id
+  blockNumber    BigInt    @map("block_number")
+  blockHash      Bytes     @map("block_hash")
+  txHash         Bytes     @map("tx_hash")
+  logIndex       Int       @map("log_index")
+  address        Bytes
+  topic0         Bytes
+  topics         Json      @default("[]")
+  data           Bytes
+  blockTimestamp DateTime  @map("block_timestamp") @db.Timestamptz(6)
+  operationId    String?   @map("operation_id")
+  orphanedAt     DateTime? @map("orphaned_at") @db.Timestamptz(6)
+  appliedAt      DateTime? @map("applied_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([txHash, logIndex], map: "uq_chain_event")
+  @@map("chain_event")
+}

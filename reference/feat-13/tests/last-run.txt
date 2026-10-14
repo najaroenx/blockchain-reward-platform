@@ -1,0 +1,49 @@
+  #   |                         ข้อรับประกัน                         |  ผล  
+------+-----------------------------------------------------------+------
+ T1   | operation ใหม่มี event seq 1 · from_status เป็น NULL         | PASS
+ T2   | event seq 2 ที่ from_status เป็น NULL → ถูกปฏิเสธ              | PASS
+ T3   | event seq 1 ซ้ำ → ถูกปฏิเสธ                                  | PASS
+ T4   | event กระโดดจาก seq 1 ไป 5 → ถูกปฏิเสธ                      | PASS
+ T5   | from_status ไม่ตรงกับแถวก่อนหน้า → ถูกปฏิเสธ                    | PASS
+ T6   | เปลี่ยนสถานะโดยไม่เขียน event → ไม่ผ่าน                         | PASS
+ T7   | เขียน event โดยสถานะไม่เปลี่ยน → ไม่ผ่าน                        | PASS
+ T8   | เปลี่ยนสถานะพร้อม event ครบ → ผ่าน · seq เดินเป็น 2             | PASS
+ T9   | เส้นทางปกติ 4 ขั้น · finalized_at ถูกเติมให้เอง                  | PASS
+ T10  | FINALIZED กลับไป SUBMITTED → ถูกปฏิเสธ                       | PASS
+ T11  | PENDING ข้ามไป FINALIZED → ถูกปฏิเสธ                         | PASS
+ T12  | reorg · CONFIRMED → ORPHANED → SUBMITTED → จบได้           | PASS
+ T13  | seq เรียง 1..7 ติดกัน แม้ status จะถอยกลางทาง                 | PASS
+ T14  | endpoint ที่เป็น http → ถูกปฏิเสธ                              | PASS
+ T15  | L6 · เก็บ secret ดิบแทน reference → ถูกปฏิเสธ                 | PASS
+ T16  | endpoint ที่ไม่ระบุ event_types → ถูกปฏิเสธ                     | PASS
+ T17  | ส่ง webhook เรื่อง event ที่ไม่เคยเกิด → ถูกปฏิเสธ                 | PASS
+ T18  | event เดียวส่งไป endpoint เดิมซ้ำ → ชน uq_delivery_event      | PASS
+ T19  | event เดียวส่งได้หลาย endpoint · เป็นงานคนละชิ้น                | PASS
+ T20  | delivery_seq ซ้ำ → ชน uq_delivery_seq                      | PASS
+ T21  | ยิงลำดับ 2 ก่อนลำดับ 1 จบ → ถูกปฏิเสธ                           | PASS
+ T22  | ลำดับ 1 SENT แล้ว → ลำดับ 2 ยิงได้                             | PASS
+ T23  | ลำดับ 1 DEAD → ลำดับ 2 ยังยิงได้                               | PASS
+ T24  | คิวของ endpoint แยกกัน · ไม่บล็อกข้ามกัน                        | PASS
+ T25  | delivery ที่ SENT แล้ว แก้ไม่ได้                                | PASS
+ T26  | แก้ payload หลังเซ็นแล้ว → ถูกปฏิเสธ                            | PASS
+ T27  | attempt ที่ไม่มีทั้งคำตอบและ error → ถูกปฏิเสธ                    | PASS
+ T28  | attempt ที่มีทั้งคำตอบและ error → ถูกปฏิเสธ                      | PASS
+ T29  | attempt นับไม่ตรงกับแถวจริง → ไม่ผ่าน                           | PASS
+ T30  | backoff ทวีคูณและมีเพดาน · 1 → 1 นาที · 6 → 32 นาที · เพดาน 60 | PASS
+ T31  | Group E · ไม่มี FK จากตารางส่ง webhook ไปหา chain_event      | PASS
+ T32  | Group E · เก็บคำตอบของร้าน เวลาที่ใช้ และ error ที่เจอ           | PASS
+ T33  | คิวหยิบเฉพาะที่ถึงเวลา · ที่ยังไม่ถึงเวลาไม่ถูกหยิบ                    | PASS
+ T34  | IN_FLIGHT โดยไม่มี claimed_at → ถูกปฏิเสธ                     | PASS
+ T35  | SENT โดยไม่มี sent_at → ถูกปฏิเสธ                             | PASS
+ T36  | outbox topic ไม่มี .vN → ถูกปฏิเสธ                            | PASS
+ T37  | ปิดท้าย · ทุก operation สถานะตรง event และ seq ไม่ขาดช่วง      | PASS
+ T24b | ส่งซ้ำแถวที่ DEAD ได้ · event_seq เดิม · ชี้กลับของเดิม             | PASS
+ T24c | ส่งซ้ำแถวที่ SENT แล้ว → ถูกปฏิเสธ                               | PASS
+ T24d | ส่งซ้ำที่อ้าง event อื่น → ถูกปฏิเสธ                               | PASS
+ T24e | ส่งครั้งแรกของ event เดิมซ้ำ → ยังถูกปฏิเสธ                       | PASS
+(41 rows)
+
+ ผ่าน | ไม่ผ่าน 
+-----+-------
+  41 |     0
+(1 row)

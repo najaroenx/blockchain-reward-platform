@@ -1,0 +1,450 @@
+openapi: 3.1.0
+info:
+  title: FEAT-08 · List on Marketplace
+  version: 1.0.0-draft
+  summary: ร้านเอาคูปองที่ถืออยู่ไปลงขายใน marketplace
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 12
+
+    **feature นี้คือเหตุผลหลักที่ `operation_step` ต้องมีอยู่** (RFD 2 D4)
+
+    การลงขายหนึ่งครั้งต้องยิงสาม tx ที่ต้องเรียงกัน
+
+    | step | ชื่อ | ทำอะไร |
+    |---|---|---|
+    | 1 | `approveCoupon` | ให้ marketplace ย้ายคูปองได้ |
+    | 2 | `createListing` | สร้างรายการขายบน chain |
+    | 3 | `lockInVault` | ย้ายคูปองเข้า escrow |
+
+    ถ้าเก็บ `tx_hash` ไว้บน `operation` แถวเดียว จะตอบไม่ได้ว่าค้างอยู่ขั้นไหน
+
+    **ของที่ลงขายคือใบที่ระบุเจาะจง ไม่ใช่จำนวน**
+
+    ขาย 5 จาก 10 ใบจึงเป็นเรื่องธรรมดา และระบบบอกได้ว่าใบไหนบ้างถูกขาย
+    ซึ่งจำเป็นเพราะตอน redeem ต้องรู้ว่าเงินก้อนไหนเป็นของใคร (FEAT-11)
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Marketplace
+    description: การลงขายคูปอง
+  - name: Operation
+    description: ติดตามงาน async
+
+paths:
+  /v1/listings:
+    post:
+      tags: [Marketplace]
+      operationId: createListing
+      summary: ลงขายคูปอง
+      description: |
+        ระบุใบที่จะขายเจาะจง · ทุกใบต้อง
+
+        - อยู่ในสถานะ `HELD`
+        - อยู่ในมือผู้ขายจริง
+        - เป็นประเภทเดียวกับที่ระบุใน `couponTypeId`
+        - ยังไม่หมดอายุ
+        - ไม่อยู่ในรายการขายอื่น
+
+        **เงื่อนไขทั้งหมดบังคับที่ฐานข้อมูล ไม่ใช่แค่ guard ในโค้ด**
+        ระบบเดิมเช็คความเป็นเจ้าของที่ api แล้วมีทางลัดที่ข้ามไปได้ (F5)
+
+        **ยอดถูกจองทันทีที่ ADMIT** · คูปองที่ลงขายแล้วเอาไปลงขายที่อื่นไม่ได้
+        จนกว่ารายการนี้จะถูกถอดหรือขายหมด
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateListingRequest' }
+            examples:
+              ขาย 5 จาก 10 ใบ:
+                value:
+                  couponTypeId: "ct_19bd"
+                  unitPrice: "80000000000000000000"
+                  couponCodeIds:
+                    - "cc_a1b2"
+                    - "cc_c3d4"
+                    - "cc_e5f6"
+                    - "cc_g7h8"
+                    - "cc_i9j0"
+      responses:
+        '202':
+          description: รับงานแล้ว · คูปองถูกกันไว้แล้ว
+          headers:
+            Location:
+              schema: { type: string }
+              example: /v1/operations/op_8f2a41
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListingAccepted' }
+              examples:
+                ปกติ:
+                  value:
+                    listingId: "lst_19bd"
+                    couponTypeId: "ct_19bd"
+                    unitPrice: "80000000000000000000"
+                    quantity: 5
+                    totalPrice: "400000000000000000000"
+                    status: "PENDING"
+                    operationId: "op_8f2a41"
+                    stepCount: 3
+        '400':
+          description: |
+            header `Idempotency-Key` หาย หรือ body ผิดรูป
+
+            `unitPrice` ต้องเป็น string ของเลขจำนวนเต็มที่มากกว่า 0 (RFD 14)
+            `couponCodeIds` ต้องมี 1–500 ใบ และห้ามซ้ำกันในคำขอเดียว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ใบซ้ำในคำขอ:
+                  value:
+                    error:
+                      code: "DUPLICATE_CODE"
+                      message: "cc_a1b2 ปรากฏมากกว่าหนึ่งครั้ง"
+                      requestId: "req_01J9X"
+        '403':
+          description: คูปองไม่ได้อยู่ในมือผู้เรียก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ไม่ใช่เจ้าของ:
+                  value:
+                    error:
+                      code: "NOT_CODE_HOLDER"
+                      message: "คูปอง cc_a1b2 ไม่ได้อยู่ในมือของคุณ"
+                      requestId: "req_01J9Y"
+        '409':
+          description: |
+            | code | หมายถึง | retry ได้ไหม |
+            |---|---|---|
+            | `CODE_ALREADY_LISTED` | คูปองอยู่ในรายการขายอื่นแล้ว | ไม่ได้ |
+            | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body ต่าง | ไม่ได้ |
+            | `IDEMPOTENCY_KEY_IN_PROGRESS` | คำขอก่อนหน้ายังไม่จบ | ได้ |
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ลงขายซ้อน:
+                  value:
+                    error:
+                      code: "CODE_ALREADY_LISTED"
+                      message: "คูปอง cc_a1b2 อยู่ในรายการขายอื่นแล้ว"
+                      requestId: "req_01J9Z"
+        '422':
+          description: |
+            | code | หมายถึง |
+            |---|---|
+            | `CODE_NOT_HELD` | คูปองยังไม่อยู่ในสถานะ `HELD` |
+            | `CODE_EXPIRED` | คูปองหมดอายุไปแล้ว |
+            | `CODE_TYPE_MISMATCH` | คูปองคนละประเภทกับที่ระบุ |
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Marketplace]
+      operationId: browseListings
+      summary: ดูรายการที่ขายอยู่
+      description: เรียงตามราคาต่อใบจากถูกไปแพง · index `ix_listing_browse` รองรับรูปนี้โดยตรง
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: couponTypeId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: maxUnitPrice
+          in: query
+          required: false
+          schema: { type: string, pattern: '^[0-9]+$' }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: รายการที่ขายอยู่
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [listings]
+                properties:
+                  listings:
+                    type: array
+                    items: { $ref: '#/components/schemas/Listing' }
+              examples:
+                สองรายการ:
+                  value:
+                    listings:
+                      - listingId: "lst_19bd"
+                        sellerKind: "MERCHANT"
+                        sellerId: "mch_8f2a"
+                        couponTypeId: "ct_19bd"
+                        unitPrice: "80000000000000000000"
+                        quantity: 5
+                        status: "ACTIVE"
+                        chain:
+                          contractAddress: "0xaaaa...aaaa"
+                          chainListingId: "42"
+                      - listingId: "lst_77ac"
+                        sellerKind: "MERCHANT"
+                        sellerId: "mch_1122"
+                        couponTypeId: "ct_19bd"
+                        unitPrice: "95000000000000000000"
+                        quantity: 2
+                        status: "ACTIVE"
+                        chain:
+                          contractAddress: "0xaaaa...aaaa"
+                          chainListingId: "43"
+
+  /v1/listings/{listingId}:
+    get:
+      tags: [Marketplace]
+      operationId: getListing
+      summary: ดูรายการขายหนึ่งอัน
+      description: |
+        ผู้ขายเห็น `couponCodeIds` ของตัวเอง · คนอื่นเห็นแค่จำนวน
+        เพราะ id ของคูปองไม่ใช่ความลับ แต่ก็ไม่มีเหตุผลที่คนซื้อต้องเห็นก่อนซื้อ
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: listingId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^lst_[0-9a-z]{4,}$' }
+      responses:
+        '200':
+          description: รายละเอียดรายการขาย
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Listing' }
+        '404':
+          description: ไม่พบรายการขาย
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/operations/{operationId}:
+    get:
+      tags: [Operation]
+      operationId: getOperation
+      summary: ดูสถานะงานลงขาย
+      description: |
+        เห็นทีละ step ว่าขั้นไหนจบแล้ว
+
+        **เฉพาะ `FINALIZED` เท่านั้นที่แปลว่ารายการขายใช้งานได้** (RFD 2 D9)
+        step 1 กับ 2 ผ่านแต่ step 3 ล้ม → `MANUAL_REVIEW` · คูปองยังถูกกันอยู่
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^op_[0-9a-z]{6,}$' }
+      responses:
+        '200':
+          description: สถานะปัจจุบัน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+              examples:
+                ค้างขั้นสาม:
+                  value:
+                    operationId: "op_8f2a41"
+                    kind: "LISTING_CREATE"
+                    status: "SUBMITTED"
+                    createdAt: "2026-10-02T03:12:44Z"
+                    finalizedAt: null
+                    steps:
+                      - index: 1
+                        name: "approveCoupon"
+                        status: "FINALIZED"
+                        txHash: "0xaa...01"
+                        nonce: 90
+                      - index: 2
+                        name: "createListing"
+                        status: "FINALIZED"
+                        txHash: "0xbb...02"
+                        nonce: 91
+                      - index: 3
+                        name: "lockInVault"
+                        status: "SUBMITTED"
+                        txHash: "0xcc...03"
+                        nonce: 92
+        '404':
+          description: ไม่พบงาน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID v4 ที่ client สร้างเอง · ส่งค่าเดิมเมื่อ retry · เก็บไว้ 72 ชั่วโมง
+      schema: { type: string, minLength: 8, maxLength: 255 }
+      example: "11111111-2222-3333-4444-555555555555"
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: จำนวนเต็มในหน่วยเล็กสุด ส่งเป็น string เสมอ (RFD 14)
+      examples: ["80000000000000000000"]
+
+    CreateListingRequest:
+      type: object
+      additionalProperties: false
+      required: [couponTypeId, unitPrice, couponCodeIds]
+      properties:
+        couponTypeId: { type: string }
+        unitPrice:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: ราคาต่อใบ · ต้องมากกว่า 0
+        couponCodeIds:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: ใบที่จะขาย · ห้ามซ้ำกันในคำขอเดียว
+          items: { type: string }
+
+    ListingStatus:
+      type: string
+      enum: [PENDING, ACTIVE, SOLD, DELISTED, FAILED]
+      description: |
+        | status | หมายถึง | ซื้อได้ไหม |
+        |---|---|---|
+        | `PENDING` | ส่งคำขอแล้ว ยังไม่อยู่บน chain | ไม่ |
+        | `ACTIVE` | ขายอยู่ | ได้ |
+        | `SOLD` | ขายหมดแล้ว | ไม่ |
+        | `DELISTED` | ถอดออกเอง | ไม่ |
+        | `FAILED` | สร้างบน chain ไม่สำเร็จ | ไม่ |
+
+    ListingChain:
+      type: object
+      required: [contractAddress, chainListingId]
+      properties:
+        contractAddress: { type: string, pattern: '^0x[0-9a-fA-F]{40}$' }
+        chainListingId:  { $ref: '#/components/schemas/BaseUnits' }
+
+    Listing:
+      type: object
+      required: [listingId, sellerKind, sellerId, couponTypeId, unitPrice, quantity, status]
+      properties:
+        listingId:    { type: string }
+        sellerKind:   { type: string, enum: [MERCHANT, CUSTOMER] }
+        sellerId:     { type: string }
+        couponTypeId: { type: string }
+        unitPrice:    { $ref: '#/components/schemas/BaseUnits' }
+        quantity:     { type: integer, minimum: 1, maximum: 500 }
+        totalPrice:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: unitPrice × quantity · คำนวณผ่าน bigint เสมอ
+        status:    { $ref: '#/components/schemas/ListingStatus' }
+        createdAt: { type: string, format: date-time }
+        couponCodeIds:
+          type: array
+          description: ผู้ขายเท่านั้นที่เห็นช่องนี้
+          items: { type: string }
+        chain:
+          oneOf:
+            - $ref: '#/components/schemas/ListingChain'
+            - type: 'null'
+
+    ListingAccepted:
+      type: object
+      required: [listingId, couponTypeId, unitPrice, quantity, totalPrice, status, operationId, stepCount]
+      properties:
+        listingId:    { type: string }
+        couponTypeId: { type: string }
+        unitPrice:    { $ref: '#/components/schemas/BaseUnits' }
+        quantity:     { type: integer }
+        totalPrice:   { $ref: '#/components/schemas/BaseUnits' }
+        status:       { const: "PENDING" }
+        operationId:  { type: string }
+        stepCount:
+          type: integer
+          const: 3
+          description: ลงขายเป็นสาม tx เสมอ
+
+    StepStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED]
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, SUBMITTED, CONFIRMED, FINALIZED, CHAIN_REVERTED, ORPHANED, MANUAL_REVIEW]
+
+    OperationStep:
+      type: object
+      required: [index, name, status]
+      properties:
+        index: { type: integer, minimum: 1, maximum: 3 }
+        name:
+          type: string
+          enum: [approveCoupon, createListing, lockInVault]
+        status: { $ref: '#/components/schemas/StepStatus' }
+        txHash: { type: [string, 'null'] }
+        nonce:  { type: [integer, 'null'], minimum: 0 }
+
+    Operation:
+      type: object
+      required: [operationId, kind, status, createdAt, steps]
+      properties:
+        operationId: { type: string }
+        kind:        { const: "LISTING_CREATE" }
+        status:      { $ref: '#/components/schemas/OperationStatus' }
+        createdAt:   { type: string, format: date-time }
+        finalizedAt: { type: [string, 'null'], format: date-time }
+        errorNote:   { type: [string, 'null'] }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/OperationStep' }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - IDEMPOTENCY_KEY_REQUIRED
+                - IDEMPOTENCY_KEY_REUSED
+                - IDEMPOTENCY_KEY_IN_PROGRESS
+                - VALIDATION_FAILED
+                - DUPLICATE_CODE
+                - NOT_CODE_HOLDER
+                - CODE_NOT_HELD
+                - CODE_EXPIRED
+                - CODE_TYPE_MISMATCH
+                - CODE_ALREADY_LISTED
+                - LISTING_NOT_FOUND
+                - FORBIDDEN
+                - RATE_LIMITED
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

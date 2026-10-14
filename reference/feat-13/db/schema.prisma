@@ -1,0 +1,322 @@
+// =====================================================================
+// FEAT-13 · Operation Status + Webhook · schema.prisma
+//
+// ไฟล์นี้สะท้อน db/migration.sql · migration เป็นต้นฉบับ ไม่ใช่ไฟล์นี้
+//
+// สิ่งที่หายไปถ้าให้ Prisma generate migration เอง
+//   · trg_opevent_chain_intact      ประวัติต่อเนื่องและไม่โกหก
+//   · trg_status_has_event (deferred) ทุกการเปลี่ยนสถานะมีประวัติรองรับ
+//   · trg_delivery_order_gate       ส่งเรียงลำดับต่อ operation
+//   · trg_delivery_terminal_immutable  จบแล้วแก้ไม่ได้
+//   · trg_endpoint_no_plain_secret  ไม่เก็บ secret ดิบ
+//   · CHECK ที่ใช้ cardinality แทน array_length
+//
+// วิธีใช้
+//   1  psql -d <db> -f db/migration.sql
+//   2  npx prisma db pull
+//   3  npx prisma generate
+//   4  ลบโฟลเดอร์ typings/ ทิ้ง
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------ enum
+enum operation_kind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+}
+
+/// ไม่เดินหน้าทางเดียว · CONFIRMED → ORPHANED เกิดได้จาก reorg
+/// client ต้องเทียบ operation_event.seq ไม่ใช่เทียบ status
+enum operation_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+}
+
+enum step_status {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+}
+
+enum merchant_status {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum actor_type {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+}
+
+enum delivery_status {
+  PENDING
+  IN_FLIGHT
+  SENT
+  DEAD
+}
+
+enum endpoint_status {
+  ACTIVE
+  PAUSED
+  DISABLED
+}
+
+// ------------------------------------------------------------ ตัวตน
+model merchant {
+  id         String          @id
+  name       String
+  status     merchant_status @default(PENDING)
+  created_at DateTime        @default(now()) @db.Timestamptz(6)
+
+  endpoints webhook_endpoint[]
+
+  @@map("merchant")
+}
+
+// -------------------------------------------- Group B · แกน write path
+model idempotency_key {
+  id              String   @id
+  scope           String
+  key             String
+  fingerprint     Bytes
+  operation_id    String?
+  response_status Int?
+  response_body   Json?
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  expires_at      DateTime @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+/// trg_operation_status_transition บังคับเส้นทาง
+/// trg_status_has_event (DEFERRED) บังคับว่าทุกการเปลี่ยนสถานะ
+/// ต้องมีแถว operation_event รองรับ ตรวจตอน COMMIT
+model operation {
+  id           String           @id
+  actor_scope  String
+  kind         operation_kind
+  status       operation_status @default(PENDING)
+  subject_id   String?
+  payload      Json
+  error_note   String?
+  created_at   DateTime         @default(now()) @db.Timestamptz(6)
+  finalized_at DateTime?        @db.Timestamptz(6)
+
+  steps        operation_step[]
+  events       operation_event[]
+  outbox       outbox[]
+  idem_keys    idempotency_key[]
+  chain_events chain_event[]
+  deliveries   webhook_delivery[]
+
+  @@index([actor_scope, created_at(sort: Desc)], map: "ix_operation_actor")
+  @@map("operation")
+}
+
+model operation_step {
+  id           String      @id
+  operation_id String
+  step_index   Int
+  name         String
+  nonce        BigInt?
+  raw_tx       Bytes?
+  tx_hash      Bytes?
+  status       step_status @default(PENDING)
+  submitted_at DateTime?   @db.Timestamptz(6)
+  confirmed_at DateTime?   @db.Timestamptz(6)
+  finalized_at DateTime?   @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@unique([operation_id, step_index], map: "uq_step_order")
+  @@map("operation_step")
+}
+
+/// ตารางที่ client ควรอ่าน ไม่ใช่ operation.status
+///
+/// seq เพิ่มขึ้นเสมอและเรียงติดกันไม่ขาดช่วง
+/// trg_opevent_chain_intact ตรวจสามเรื่องตอน INSERT
+///   seq ต้องต่อจากแถวก่อนหน้าพอดี
+///   from_status ต้องตรงกับ to_status ของแถวก่อนหน้า
+///   seq 1 ต้องมีได้แถวเดียว และต้องเป็นแถวเดียวที่ from_status เป็น NULL
+model operation_event {
+  id           String            @id
+  operation_id String
+  seq          Int
+  from_status  operation_status?
+  to_status    operation_status
+  actor        actor_type        @default(SYSTEM)
+  tx_hash      Bytes?
+  metadata     Json              @default("{}")
+  created_at   DateTime          @default(now()) @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@unique([operation_id, seq], map: "uq_opevent_seq")
+  @@map("operation_event")
+}
+
+model outbox {
+  id           String    @id
+  operation_id String
+  topic        String
+  payload      Json
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  sent_at      DateTime? @db.Timestamptz(6)
+
+  operation operation @relation(fields: [operation_id], references: [id], onDelete: Cascade)
+
+  @@map("outbox")
+}
+
+// --------------------------------------------- Group C · ฝั่งอ่าน chain
+model chain_event {
+  id              String    @id
+  block_number    BigInt
+  block_hash      Bytes
+  tx_hash         Bytes
+  log_index       Int
+  address         Bytes
+  topic0          Bytes
+  topics          Json      @default("[]")
+  data            Bytes
+  block_timestamp DateTime  @db.Timestamptz(6)
+  operation_id    String?
+  orphaned_at     DateTime? @db.Timestamptz(6)
+  applied_at      DateTime? @db.Timestamptz(6)
+
+  operation operation? @relation(fields: [operation_id], references: [id])
+
+  @@unique([tx_hash, log_index], map: "uq_chain_event")
+  @@map("chain_event")
+}
+
+// ======================================================================
+// Group E · บันทึกการทำงาน · ไม่ใช่ projection
+//
+// RFD 6 §3.2 ตั้งกฎของ Group D ว่าลบทิ้งแล้ว replay chain_event
+// ต้องได้ค่าเดิมเป๊ะ · สามตารางต่อจากนี้ทำแบบนั้นไม่ได้ และห้ามลอง
+//
+//   ลบแล้ว replay ไม่ได้แปลว่าได้ข้อมูลคืน
+//   แต่แปลว่ายิง webhook ไปหาร้านใหม่ทั้งหมด
+//
+// ห้ามใส่สามตารางนี้ในสคริปต์ที่ลบ Group D เพื่อสร้างใหม่
+// ======================================================================
+
+/// L6 analogue · ไม่เก็บ secret ในฐานข้อมูล เก็บแค่ kms:// reference
+/// trg_endpoint_no_plain_secret ปฏิเสธถ้าเผลอยัดค่าดิบลงไป
+///
+/// event_types ใช้ cardinality ไม่ใช่ array_length
+/// เพราะ array_length ของ array ว่างคืน NULL และ CHECK ที่ได้ NULL ถือว่าผ่าน
+model webhook_endpoint {
+  id           String          @id
+  merchant_id  String
+  url          String
+  secret_ref   String
+  event_types  String[]
+  status       endpoint_status @default(ACTIVE)
+  max_attempts Int             @default(6)
+  created_at   DateTime        @default(now()) @db.Timestamptz(6)
+
+  merchant   merchant           @relation(fields: [merchant_id], references: [id])
+  deliveries webhook_delivery[]
+
+  @@map("webhook_endpoint")
+}
+
+/// งานส่งหนึ่งชิ้น · หนึ่ง event ไปหนึ่ง endpoint
+///
+/// delivery_seq เป็นลำดับต่อ (endpoint, operation)
+/// trg_delivery_order_gate บังคับให้ลำดับก่อนหน้าจบ (SENT หรือ DEAD)
+/// ก่อนจะยิงลำดับถัดไป · ร้านจึงได้ event ของงานเดียวกันเรียงตามจริง
+///
+/// trg_delivery_terminal_immutable · SENT และ DEAD แก้ไม่ได้
+/// การส่งซ้ำคือการสร้างแถวใหม่ ไม่ใช่การปลุกแถวเดิม
+model webhook_delivery {
+  id              String          @id
+  endpoint_id     String
+  operation_id    String
+  event_seq       Int
+  delivery_seq    Int
+  event_type      String
+  payload         Json
+  signature       String
+  signed_at       DateTime        @db.Timestamptz(6)
+  status          delivery_status @default(PENDING)
+  attempt         Int             @default(0)
+  next_attempt_at DateTime        @default(now()) @db.Timestamptz(6)
+  claimed_at      DateTime?       @db.Timestamptz(6)
+  sent_at         DateTime?       @db.Timestamptz(6)
+  dead_at         DateTime?       @db.Timestamptz(6)
+  created_at      DateTime        @default(now()) @db.Timestamptz(6)
+  /// ชี้กลับไปที่แถวเดิมเมื่อเป็นการส่งซ้ำ · NULL = ส่งครั้งแรก
+  ///
+  /// uq_delivery_event เป็น partial index ที่ครอบเฉพาะ replay_of IS NULL
+  /// เขียนใน Prisma ไม่ได้ · ถ้าเป็น unique เต็ม การส่งซ้ำจะเป็นไปไม่ได้เลย
+  /// เพราะแถวใหม่ใช้ event_seq เดิม
+  replay_of       String?
+
+  endpoint  webhook_endpoint           @relation(fields: [endpoint_id], references: [id])
+  operation operation                  @relation(fields: [operation_id], references: [id])
+  attempts  webhook_delivery_attempt[]
+  original  webhook_delivery?          @relation("replay", fields: [replay_of], references: [id])
+  replays   webhook_delivery[]         @relation("replay")
+
+  @@unique([endpoint_id, operation_id, delivery_seq], map: "uq_delivery_seq")
+  @@map("webhook_delivery")
+}
+
+/// ตารางที่เป็น Group E ชัดที่สุด
+///
+/// ไม่มีคอลัมน์ไหนในนี้ที่สืบกลับไปหา chain_event ได้แม้แต่คอลัมน์เดียว
+/// chain ไม่รู้ว่าร้านตอบ 500 · ไม่รู้ว่าใช้เวลา 3 วินาที
+/// ไม่รู้ว่าลองครั้งที่ 4 · และจะไม่มีวันรู้
+///
+/// ck_attempt_outcome · ต้องมี response_status หรือ error_note อย่างใดอย่างหนึ่ง
+/// ยิงแล้วไม่ได้คำตอบและไม่มีข้อผิดพลาด เป็นไปไม่ได้
+model webhook_delivery_attempt {
+  id              String   @id
+  delivery_id     String
+  attempt         Int
+  started_at      DateTime @db.Timestamptz(6)
+  finished_at     DateTime @db.Timestamptz(6)
+  response_status Int?
+  response_body   String?
+  error_note      String?
+
+  delivery webhook_delivery @relation(fields: [delivery_id], references: [id], onDelete: Cascade)
+
+  @@unique([delivery_id, attempt], map: "uq_attempt_seq")
+  @@map("webhook_delivery_attempt")
+}

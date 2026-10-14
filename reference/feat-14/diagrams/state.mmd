@@ -1,0 +1,39 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> อ่านมาแล้ว : INSERT chain_event พร้อมขยับ cursor
+
+    note right of อ่านมาแล้ว
+        applied_at NULL
+        อยู่ในคิวของ projector
+        เรียงตาม block_number แล้ว log_index
+    end note
+
+    อ่านมาแล้ว --> apply_แล้ว : f_apply_event สำเร็จ
+    อ่านมาแล้ว --> หลุดจากสาย : reorg ก่อนที่จะ apply
+
+    apply_แล้ว --> final : ลึกกว่า N บล็อกจาก tip
+    apply_แล้ว --> หลุดจากสาย : reorg · ล้าง applied_at ก่อน orphan
+
+    note right of apply_แล้ว
+        projection เปลี่ยนแล้ว
+        แต่ยังย้อนได้ด้วยการ orphan แล้ว replay
+    end note
+
+    note left of final
+        orphan ไม่ได้อีก
+        trg_final_not_orphanable ปฏิเสธ
+        reorg ที่กินช่วงนี้ไป MANUAL_REVIEW
+        ถ้า event ที่บอกว่าจบแล้วยังหลุดได้
+        ค่า N ก็ไม่มีความหมาย
+    end note
+
+    note left of หลุดจากสาย
+        orphaned_at มีค่า
+        applied_at ต้องเป็น NULL
+        ck_orphan_not_applied บังคับ
+        ไม่ลบแถว · เก็บไว้เป็นประวัติ
+    end note
+
+    final --> [*]
+    หลุดจากสาย --> [*]

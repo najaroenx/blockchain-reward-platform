@@ -1,0 +1,76 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant A as api
+    participant D as PostgreSQL
+    participant W as worker
+    participant N as chain
+    participant I as indexer
+
+    rect rgb(248,249,250)
+    Note over C,D: ADMIT · api · transaction เดียว
+    C->>+A: POST /v1/coupons/redeem · Idempotency-Key · { couponCode }
+    A->>A: ไม่มี header → 400 · ไม่สร้างให้เอง
+    A->>A: fingerprint = sha256(canonical DTO) · ไม่มี salt
+    A->>+D: BEGIN
+    A->>D: INSERT idempotency_key ON CONFLICT DO NOTHING
+    alt 0 rows · เคยเห็น key นี้
+        D-->>A: แถวเดิม
+        A->>A: fingerprint ต่าง → 409 · ตรง → replay response เดิม
+    else 1 row · ครั้งแรก
+        A->>D: SELECT coupon_code WHERE code_hash AND holder_id = actor
+        D-->>A: ไม่เจอ → 404 · เจอ → ไปต่อ
+        A->>D: SELECT escrow WHERE token_id AND active
+        A->>D: INSERT operation COUPON_REDEEM · PENDING
+        A->>D: INSERT operation_step 1 burnCoupon · 2 releaseFundsPartial
+        A->>D: INSERT reservation COUPON_UNIT · ESCROW
+        Note right of D: partial unique index<br/>ใบนี้ถูกจองอยู่แล้ว → 409 ทันที
+        A->>D: INSERT outbox · operation.prepared.v1
+        A->>D: UPDATE idempotency_key SET response 202
+        D-->>-A: COMMIT
+    end
+    A-->>-C: 202 { operationId } · Location /v1/operations/id
+    end
+
+    Note over W,N: SUBMIT · worker · step 1 ต้องจบก่อน step 2
+    W->>+D: claim outbox WHERE sent_at IS NULL FOR UPDATE SKIP LOCKED
+    D-->>-W: operation
+    W->>D: SELECT next_nonce FROM signer FOR UPDATE
+    W->>W: build raw_tx · burnCoupon(code_ref)
+    W->>D: UPDATE step 1 SET raw_tx nonce · COMMIT ก่อน broadcast
+    W->>+N: eth_sendRawTransaction
+    N-->>-W: tx_hash
+    W->>D: UPDATE step 1 → SUBMITTED · INSERT operation_event
+
+    Note over I,N: OBSERVE · indexer · instance เดียว
+    I->>+N: eth_getLogs fromBlock = cursor
+    N-->>-I: logs
+    I->>D: INSERT chain_event ON CONFLICT (tx_hash, log_index) DO NOTHING
+    I->>D: UPDATE indexer_cursor · transaction เดียวกัน
+
+    Note over W,D: step 1 FINALIZED แล้วจึงเริ่ม step 2
+    W->>D: step 1 → FINALIZED เมื่อผ่าน N block และ block_hash ยังอยู่
+    W->>W: build raw_tx · releaseFundsPartial(tokenId, 1)
+    W->>D: UPDATE step 2 SET raw_tx nonce
+    W->>+N: eth_sendRawTransaction
+    N-->>-W: tx_hash
+    alt step 2 ล้ม
+        W->>D: operation → MANUAL_REVIEW · ไม่ย้อน step 1
+        Note right of W: burn ไปแล้วย้อนไม่ได้<br/>เงินยังค้างใน vault กู้ได้
+    else step 2 สำเร็จ
+        W->>D: UPDATE coupon_code → REDEEMED · escrow.remaining ลด
+        W->>D: operation → FINALIZED · ปล่อย reservation ทั้งสอง
+        W->>D: INSERT webhook_delivery operation.finalized
+    end
+
+    C->>+A: GET /v1/operations/id
+    A->>D: SELECT operation + steps · อ่าน projection ไม่อ่าน chain
+    A-->>-C: { status FINALIZED, steps[2] }

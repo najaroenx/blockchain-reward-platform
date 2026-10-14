@@ -1,0 +1,25 @@
+  #  |                         ข้อรับประกัน                         |  ผล  
+-----+-----------------------------------------------------------+------
+ T1  | สร้าง point type ซ้ำด้วย key เดิม → แถวที่สองได้ 0 rows          | PASS
+ T2  | ร้านที่ status ยังไม่ ACTIVE สร้าง point type ไม่ได้              | PASS
+ T3  | symbol ที่เป็นตัวเล็ก สั้นไป หรือมีช่องว่าง → ถูกปฏิเสธ                | PASS
+ T4  | decimals เกิน 30 หรือติดลบ → ถูกปฏิเสธ                         | PASS
+ T5  | ร้านเดียวกันใช้ symbol ซ้ำ → ถูกปฏิเสธ                           | PASS
+ T6  | ชื่อเดียวกันที่มีช่องว่างหน้าหลัง → ถูกปฏิเสธ                          | PASS
+ T7  | deploy ล้มแล้วใช้ชื่อและ symbol เดิมสร้างใหม่ได้                   | PASS
+ T8  | สั่ง deploy point type เดิมซ้อนกัน → ถูกปฏิเสธ                   | PASS
+ T9  | แก้ contract_address ของ point type ที่ deploy แล้ว → ถูกปฏิเสธ | PASS
+ T10 | contract address เดียวกันผูกกับสอง point type → ถูกปฏิเสธ       | PASS
+ T11 | epoch_seconds หรือ validity_epochs เป็น 0 → ถูกปฏิเสธ         | PASS
+ T12 | เปลี่ยน step เป็น SUBMITTED โดยไม่มี raw_tx → ถูกปฏิเสธ          | PASS
+ T13 | topic ที่ไม่มีเวอร์ชันต่อท้าย → ถูกปฏิเสธ                           | PASS
+ T14 | อ่าน log ช่วงเดิมซ้ำ → chain_event ไม่เกิดแถวซ้ำ                 | PASS
+ T15 | ไม่มี point type ที่ LIVE แต่ยังไม่มี contract                    | PASS
+ T16 | ไม่มี operation ที่ไม่มีใครมาทำ (orphan = 0)                    | PASS
+ T17 | point_type_chain ไม่มีคอลัมน์ที่มาจากร้าน · replay ได้ทั้งตาราง     | PASS
+(17 rows)
+
+ ผ่าน | ไม่ผ่าน 
+-----+-------
+  17 |     0
+(1 row)

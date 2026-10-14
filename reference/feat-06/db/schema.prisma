@@ -1,0 +1,171 @@
+// =====================================================================
+// FEAT-06 · Point Balance · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อใน DB เป็น snake_case
+//
+// ชุดนี้เป็นฝั่งอ่านล้วน · ตรรกะส่วนใหญ่อยู่ในฟังก์ชัน SQL ไม่ใช่ใน model
+// Prisma ประกาศ function, partial index และ INCLUDE ไม่ได้
+// จึงอยู่ใน migration.sql เท่านั้น · อ่าน comment ที่นั่นประกอบ
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum HolderKind {
+  MERCHANT
+  CUSTOMER
+
+  @@map("holder_kind")
+}
+
+enum PointTypeStatus {
+  REQUESTED
+  LIVE
+  FAILED
+  RETIRED
+
+  @@map("point_type_status")
+}
+
+enum ReservationSubject {
+  POINT_BALANCE
+  COUPON_UNIT
+  LISTING
+  THB_BALANCE
+  ESCROW
+
+  @@map("reservation_subject")
+}
+
+// ---------------------------------------------- ตัวตน (FEAT-01 · FEAT-04)
+model Merchant {
+  id        String   @id
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  pointTypes PointType[]
+
+  @@map("merchant")
+}
+
+model Customer {
+  id        String   @id
+  telHash   Bytes    @map("tel_hash")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([telHash], map: "uq_customer_tel")
+  @@map("customer")
+}
+
+model PointType {
+  id         String          @id
+  merchantId String          @map("merchant_id")
+  name       String
+  symbol     String
+  decimals   Int             @db.SmallInt
+  status     PointTypeStatus @default(REQUESTED)
+
+  merchant Merchant             @relation(fields: [merchantId], references: [id])
+  chain    PointTypeChain?
+  buckets  PointBalanceBucket[]
+
+  @@map("point_type")
+}
+
+/// ค่าคงที่ของ contract · ทำให้ expiresAt ของทุก bucket คำนวณได้ซ้ำเสมอ
+model PointTypeChain {
+  pointTypeId     String   @id @map("point_type_id")
+  contractAddress Bytes    @map("contract_address")
+  genesisAt       DateTime @map("genesis_at") @db.Timestamptz(6)
+  epochSeconds    Int      @map("epoch_seconds")
+  validityEpochs  Int      @map("validity_epochs")
+
+  pointType PointType @relation(fields: [pointTypeId], references: [id])
+
+  @@map("point_type_chain")
+}
+
+// ============================================================= ยอด
+/// RFD 10 · ไม่มีคอลัมน์ "ยอดคงเหลือ" ที่ไหน · พิสูจน์ด้วย T18
+///
+/// index ที่ query ยอดใช้จริงคือ ix_bucket_live ใน migration.sql
+///   (point_type_id, holder_kind, holder_id, expires_at) INCLUDE (amount) WHERE amount > 0
+/// สามตัวแรกเป็น equality ตัวสุดท้ายเป็น range · INCLUDE ทำให้ index-only scan ได้
+/// T20 ใช้ EXPLAIN ยืนยันว่า planner เลือก index ตัวนี้จริง
+model PointBalanceBucket {
+  id          String     @id
+  pointTypeId String     @map("point_type_id")
+  holderKind  HolderKind @map("holder_kind")
+  holderId    String     @map("holder_id")
+  epochIndex  Int        @map("epoch_index")
+  /// RFD 14 · base units เสมอ
+  amount      Decimal    @db.Decimal(78, 0)
+  receivedAt  DateTime   @map("received_at") @db.Timestamptz(6)
+  expiresAt   DateTime   @map("expires_at") @db.Timestamptz(6)
+  updatedAt   DateTime   @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  pointType PointType      @relation(fields: [pointTypeId], references: [id])
+  notices   ExpiryNotice[]
+
+  @@unique([pointTypeId, holderKind, holderId, epochIndex], map: "uq_bucket")
+  @@index([pointTypeId, holderKind, holderId, expiresAt], map: "ix_bucket_live")
+  @@map("point_balance_bucket")
+}
+
+/// ชุดนี้อ่านอย่างเดียว · การสร้างและปล่อยอยู่ใน FEAT-05
+model Reservation {
+  id          String             @id
+  subjectType ReservationSubject @map("subject_type")
+  subjectId   String             @map("subject_id")
+  amount      Decimal            @db.Decimal(78, 0)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  releasedAt  DateTime?          @map("released_at") @db.Timestamptz(6)
+
+  @@index([subjectType, subjectId], map: "ix_reservation_open")
+  @@map("reservation")
+}
+
+// ===================================================== ความทันของข้อมูล
+/// มีได้แถวเดียว · บังคับด้วย PRIMARY KEY boolean + CHECK (id) ใน migration.sql
+/// trigger trg_watermark_monotonic กันไม่ให้ค่าถอยหลัง
+model ProjectionWatermark {
+  id          Boolean  @id @default(true)
+  lastBlock   BigInt   @map("last_block")
+  lastBlockAt DateTime @map("last_block_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("projection_watermark")
+}
+
+model IndexerCursor {
+  contractAddress Bytes    @id @map("contract_address")
+  lastBlock       BigInt   @map("last_block")
+  updatedAt       DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("indexer_cursor")
+}
+
+// ================================================ การแจ้งเตือนก่อนหมดอายุ
+/// ไม่มี cron ที่ไล่ลดยอด · มีแค่ query หา bucket ที่ใกล้หมดอายุ
+/// ตารางนี้กันการแจ้งซ้ำ · job ที่รันซ้ำจึงไม่ส่งข้อความเดิมสองรอบ
+///
+/// trigger trg_notice_not_expired กันไม่ให้แจ้งล่วงหน้าของก้อนที่หมดอายุไปแล้ว
+model ExpiryNotice {
+  id            String   @id
+  bucketId      String   @map("bucket_id")
+  /// อนุญาตแค่ 30, 7, 1 · CHECK ใน migration.sql บังคับไว้
+  thresholdDays Int      @map("threshold_days")
+  notifiedAt    DateTime @default(now()) @map("notified_at") @db.Timestamptz(6)
+  channel       String
+
+  bucket PointBalanceBucket @relation(fields: [bucketId], references: [id], onDelete: Cascade)
+
+  @@unique([bucketId, thresholdDays], map: "uq_notice")
+  @@map("expiry_notice")
+}

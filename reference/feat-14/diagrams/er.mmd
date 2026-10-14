@@ -1,0 +1,103 @@
+erDiagram
+    merchant ||--o{ point_type : "ออก"
+    merchant ||--o{ coupon_type : "ออก"
+    coupon_type ||--o{ coupon_code : "มีใบ"
+
+    raw_block ||--o{ chain_event : "log ในบล็อกนี้"
+    operation ||--o{ chain_event : "งานที่ตรงกัน"
+
+    coupon_code ||--o| coupon_holding : "ใครถืออยู่"
+    point_type ||--o{ point_balance : "ยอดของใคร"
+
+    merchant {
+        text id PK
+        merchant_status status
+    }
+
+    customer {
+        text id PK
+    }
+
+    point_type {
+        text id PK
+        text merchant_id FK
+    }
+
+    coupon_type {
+        text id PK
+        text merchant_id FK
+    }
+
+    coupon_code {
+        text id PK
+        bytea code_ref "UNIQUE · chain รู้จักด้วยค่านี้"
+        coupon_code_state state "เป็น projection ด้วย · ต้อง replay ได้"
+    }
+
+    finality_config {
+        text id PK
+        integer depth_blocks "ค่า N · คำถามที่ RFD 1 ค้างไว้"
+        timestamptz effective_from "UNIQUE · f_finality_depth ตอบตามเวลา"
+    }
+
+    indexer_cursor {
+        text id PK "CHECK เท่ากับ main · แถวเดียวเท่านั้น"
+        bigint last_block "ขยับได้เฉพาะคนถือ lease"
+        bytea last_block_hash "ใช้เทียบ parent ของบล็อกถัดไป"
+        text lease_owner "กัน process ที่แฮงค์"
+        timestamptz lease_until
+    }
+
+    raw_block {
+        bytea block_hash PK "ตัวตนของบล็อกคือ hash ไม่ใช่ความสูง"
+        bigint block_number "UNIQUE เฉพาะที่ยังไม่ orphan"
+        bytea parent_hash "ต้องตรงกับบล็อกก่อนหน้า ไม่งั้นคือ reorg"
+        timestamptz timestamp "ที่มาของ as_of_time ใน projection"
+        timestamptz orphaned_at "สายที่แพ้ยังเก็บไว้ ไม่ลบทิ้ง"
+    }
+
+    chain_event {
+        text id PK
+        bigint block_number "ห้ามเกิน cursor ตอน COMMIT"
+        bytea block_hash FK
+        bytea tx_hash "UNIQUE กับ log_index"
+        integer log_index
+        bytea data "ของจริงจาก chain"
+        jsonb args "แคชของการถอดรหัส · สร้างใหม่ได้"
+        chain_event_name event_name "รู้จักชนิดต้องมี args"
+        timestamptz applied_at "orphan แล้วต้องเป็น NULL"
+        timestamptz orphaned_at
+        timestamptz finalized_at "ตั้งแล้ว orphan ไม่ได้อีก"
+    }
+
+    coupon_holding {
+        text coupon_code_id PK
+        holder_kind holder_kind
+        text holder_id
+        bigint as_of_block
+        timestamptz as_of_time "มาจาก block_timestamp ห้ามจาก now()"
+    }
+
+    point_balance {
+        text point_type_id PK
+        holder_kind holder_kind PK
+        text holder_id PK
+        numeric amount "78 0 · ติดลบไม่ได้"
+        bigint as_of_block
+    }
+
+    reorg_log {
+        text id PK
+        bigint fork_block
+        bigint old_tip
+        integer depth "ต้องเท่ากับ old_tip ลบ fork บวกหนึ่ง"
+        integer finality_depth "N ตอนที่เกิด"
+        reorg_outcome outcome "ต้องตรงกับความลึกจริง เลือกเองไม่ได้"
+        text note
+    }
+
+    operation {
+        text id PK
+        operation_kind kind
+        operation_status status
+    }

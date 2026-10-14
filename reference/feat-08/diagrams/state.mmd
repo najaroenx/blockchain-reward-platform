@@ -1,0 +1,22 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING : COMMIT ของ ADMIT สำเร็จ · คูปองถูกกันแล้ว
+    PENDING --> ACTIVE : ทั้งสาม step FINALIZED
+    PENDING --> FAILED : step ใด step หนึ่งล้มถาวร
+    ACTIVE --> SOLD : ขายหมด · ดู FEAT-10
+    ACTIVE --> DELISTED : ผู้ขายถอดออก · ดู FEAT-09
+    FAILED --> [*]
+    SOLD --> [*]
+    DELISTED --> [*]
+    note right of PENDING
+        สามขั้นต้องเรียงกัน
+        approveCoupon
+        createListing
+        lockInVault
+        ขั้นถัดไปเริ่มได้เมื่อขั้นก่อนจบ
+    end note
+    note right of ACTIVE
+        คูปองยังถูกกันอยู่
+        ปล่อยเมื่อขายหมดหรือถอดออกเท่านั้น
+    end note

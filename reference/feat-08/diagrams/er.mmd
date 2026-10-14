@@ -1,0 +1,65 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT        ||--o{ COUPON_TYPE : "ออกประเภทคูปอง"
+    COUPON_TYPE     ||--o{ COUPON_CODE : "มีหลายใบ"
+    COUPON_TYPE     ||--o{ LISTING : "ลงขายได้หลายรายการ"
+    LISTING         ||--o{ LISTING_ITEM : "ใบที่ขายเจาะจง"
+    COUPON_CODE     ||--o{ LISTING_ITEM : "อยู่ในรายการขาย"
+    LISTING         ||--o| LISTING_CHAIN : "มีได้เมื่อ createListing สำเร็จ"
+    IDEMPOTENCY_KEY ||--o| OPERATION : "ชี้ไปที่"
+    OPERATION       ||--o{ OPERATION_STEP : "สามขั้นเรียงกัน"
+    OPERATION       ||--|| OUTBOX : "ปลุก worker"
+    OPERATION       ||--o{ RESERVATION : "กันคูปองและรายการ"
+
+    LISTING {
+        text id PK
+        enum seller_kind "MERCHANT CUSTOMER"
+        text seller_id
+        text coupon_type_id FK
+        numeric unit_price "78,0 · ต้องมากกว่า 0"
+        int quantity "1 ถึง 500"
+        enum status "PENDING ACTIVE SOLD DELISTED FAILED"
+        timestamptz active_at
+    }
+    LISTING_ITEM {
+        text id PK
+        text listing_id UK
+        text coupon_code_id UK "ใบที่ระบุเจาะจง"
+    }
+    LISTING_CHAIN {
+        text listing_id PK
+        bytea contract_address UK "แก้ไม่ได้หลังเขียน"
+        numeric chain_listing_id UK "78,0"
+        bigint created_block
+    }
+    COUPON_CODE {
+        text id PK
+        text coupon_type_id FK
+        bytea code_hash UK
+        bytea code_ref UK
+        enum state "ต้องเป็น HELD ถึงลงขายได้"
+        enum holder_kind "ต้องตรงกับผู้ขาย"
+        text holder_id
+    }
+    RESERVATION {
+        text id PK
+        text operation_id FK
+        enum subject_type "COUPON_UNIT LISTING"
+        text subject_id UK "ของชิ้นเดียวจองซ้อนไม่ได้"
+        timestamptz released_at "ปล่อยได้เมื่องานจบเท่านั้น"
+    }
+    OPERATION {
+        text id PK
+        enum kind "LISTING_CREATE LISTING_DELETE"
+        enum status "PENDING..FINALIZED"
+        text subject_id UK "listing_id · กันสั่งงานซ้อน"
+    }
+    OPERATION_STEP {
+        text id PK
+        text operation_id FK
+        int step_index UK "1 2 3"
+        text name "approveCoupon createListing lockInVault"
+        bigint nonce UK
+        bytea raw_tx "COMMIT ก่อน broadcast"
+        bytea tx_hash UK
+    }

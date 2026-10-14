@@ -1,0 +1,385 @@
+openapi: 3.1.0
+info:
+  title: FEAT-06 · Point Balance · bucket + expiry query
+  version: 1.0.0-draft
+  summary: อ่านยอด point · พยากรณ์การหมดอายุ · แจ้งเตือนล่วงหน้า
+  description: |
+    ส่วนหนึ่งของ `api-spec-v1` · เหตุผลเบื้องหลังอยู่ใน RFD 6 และ RFD 10
+
+    **ชุดนี้เป็นฝั่งอ่านล้วน** ไม่มี `operation` ไม่มี `outbox` ไม่มี chain tx
+    จึงไม่ต้องใช้ `Idempotency-Key` เลย
+
+    **หลักเดียวที่ทั้งชุดตั้งอยู่บน · ทุก query รับ `asOf`**
+
+    ```text
+    ยอดที่ใช้ได้ ณ เวลา T = Σ bucket ที่ expires_at > T  −  Σ reservation ที่ยังไม่ปล่อย
+    ```
+
+    ฟังก์ชันอ่านทุกตัวในฐานข้อมูลรับ `as_of` เป็นพารามิเตอร์ และ**ไม่เรียก `now()` ข้างใน**
+    คำตอบจึงเป็นฟังก์ชันบริสุทธิ์ของ (ข้อมูล, เวลา) — ทดสอบซ้ำได้ และตอบคำถาม
+    "ยอดเมื่อสิ้นเดือนที่แล้วเท่าไหร่" กับ "อีก 30 วันจะเหลือเท่าไหร่" ด้วย query เดียวกัน
+
+    **ไม่มีคอลัมน์ `available` ที่ไหนในฐานข้อมูล** ถ้าเก็บไว้ ค่าจะผิดทันทีที่เวลา
+    เดินผ่านวันหมดอายุ โดยไม่มี event อะไรมากระตุ้นให้อัปเดต (RFD 10)
+
+    **ความทันของข้อมูล** — ทุก response มี `asOfBlock` และ `lagBlocks`
+    เพราะ projection ตามหลัง chain เสมอ ผู้เรียกต้องรู้ว่ายอดที่เห็นทันแค่ไหน
+
+servers:
+  - url: https://api.example.com
+    description: production
+  - url: https://api.staging.example.com
+    description: staging
+
+tags:
+  - name: Balance
+    description: ยอดคงเหลือและการหมดอายุ
+
+paths:
+  /v1/point-balances:
+    get:
+      tags: [Balance]
+      operationId: getPointBalance
+      summary: ยอด point ของผู้ถือคนหนึ่ง
+      description: |
+        คืนยอดที่ใช้ได้ ยอดที่ถูกกันไว้ และรายละเอียด bucket แยกตามวันหมดอายุ
+
+        `asOf` ใส่ได้ทั้งอดีตและอนาคต — ค่าปริยายคือเวลาปัจจุบัน
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: pointTypeId
+          in: query
+          required: true
+          schema: { type: string, pattern: '^pt_[0-9a-z]{4,}$' }
+        - name: holderKind
+          in: query
+          required: true
+          schema: { type: string, enum: [MERCHANT, CUSTOMER] }
+        - name: holderId
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AsOf'
+        - name: includeExpired
+          in: query
+          required: false
+          description: true เพื่อให้รายการ bucket รวมก้อนที่หมดอายุไปแล้วด้วย · ยอดที่ใช้ได้ไม่เปลี่ยน
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: ยอดคงเหลือ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceView' }
+              examples:
+                ปัจจุบัน:
+                  summary: สามก้อนที่ยังใช้ได้
+                  value:
+                    pointTypeId: "pt_19bd"
+                    holderKind: "CUSTOMER"
+                    holderId: "cus_8f2a"
+                    decimals: 18
+                    asOf: "2026-10-01T00:00:00Z"
+                    available: "600"
+                    reserved: "0"
+                    unexpiredTotal: "600"
+                    buckets:
+                      - bucketId: "bkt_soon"
+                        amount: "100"
+                        receivedAt: "2026-06-23T00:00:00Z"
+                        expiresAt: "2026-10-06T00:00:00Z"
+                        expired: false
+                      - bucketId: "bkt_mid"
+                        amount: "200"
+                        receivedAt: "2026-08-02T00:00:00Z"
+                        expiresAt: "2026-10-21T00:00:00Z"
+                        expired: false
+                      - bucketId: "bkt_far"
+                        amount: "300"
+                        receivedAt: "2026-09-01T00:00:00Z"
+                        expiresAt: "2026-12-30T00:00:00Z"
+                        expired: false
+                    freshness:
+                      asOfBlock: 1002
+                      lagBlocks: 3
+                      lagSeconds: 36
+                ล่วงหน้า 30 วัน:
+                  summary: ถามอนาคต · ก้อนที่จะหมดอายุถูกตัดออกเอง
+                  value:
+                    pointTypeId: "pt_19bd"
+                    holderKind: "CUSTOMER"
+                    holderId: "cus_8f2a"
+                    decimals: 18
+                    asOf: "2026-10-31T00:00:00Z"
+                    available: "300"
+                    reserved: "0"
+                    unexpiredTotal: "300"
+                    buckets:
+                      - bucketId: "bkt_far"
+                        amount: "300"
+                        receivedAt: "2026-09-01T00:00:00Z"
+                        expiresAt: "2026-12-30T00:00:00Z"
+                        expired: false
+                    freshness:
+                      asOfBlock: 1002
+                      lagBlocks: 3
+                      lagSeconds: 36
+        '400':
+          description: พารามิเตอร์ผิดรูป เช่น `asOf` ไม่ใช่ RFC 3339
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: ขอดูยอดของคนอื่น
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: ไม่พบ point type · ตอบเหมือนกันกับกรณีไม่มีสิทธิ์
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/point-balances/expiry-forecast:
+    get:
+      tags: [Balance]
+      operationId: getExpiryForecast
+      summary: ยอดที่จะหมดอายุในแต่ละวัน
+      description: |
+        รวมยอดตามวันหมดอายุ เรียงจากใกล้ไปไกล · ใช้ทำกราฟหรือข้อความเตือนในแอป
+
+        ไม่นับก้อนที่หมดอายุไปแล้ว และไม่นับก้อนที่ยอดเป็นศูนย์
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: pointTypeId
+          in: query
+          required: true
+          schema: { type: string }
+        - name: holderKind
+          in: query
+          required: true
+          schema: { type: string, enum: [MERCHANT, CUSTOMER] }
+        - name: holderId
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/AsOf'
+        - name: horizonDays
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 730, default: 90 }
+      responses:
+        '200':
+          description: พยากรณ์การหมดอายุ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ForecastView' }
+              examples:
+                สองวัน:
+                  value:
+                    pointTypeId: "pt_19bd"
+                    asOf: "2026-10-01T00:00:00Z"
+                    horizonDays: 30
+                    totalExpiring: "300"
+                    days:
+                      - expiresOn: "2026-10-06"
+                        amount: "100"
+                      - expiresOn: "2026-10-21"
+                        amount: "200"
+
+  /v1/point-balances/expiry-notices:
+    post:
+      tags: [Balance]
+      operationId: recordExpiryNotice
+      summary: บันทึกว่าแจ้งเตือนไปแล้ว
+      description: |
+        เรียกหลังส่งข้อความแจ้งเตือนสำเร็จ · **ไม่ใช่ endpoint ที่ส่งข้อความเอง**
+
+        `UNIQUE (bucketId, thresholdDays)` ทำให้บันทึกซ้ำที่ระดับเดิมเป็นไปไม่ได้
+        job ที่รันซ้ำจึงไม่ทำให้ลูกค้าได้ข้อความเดิมสองรอบ · เรียกซ้ำได้ `409` ไม่ใช่ error ที่ต้องแก้
+
+        ระดับที่อนุญาตมีแค่ 30, 7 และ 1 วัน · บังคับด้วย `CHECK` ในฐานข้อมูล
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NoticeRequest' }
+            examples:
+              เตือน 7 วัน:
+                value:
+                  bucketId: "bkt_soon"
+                  thresholdDays: 7
+                  channel: "PUSH"
+      responses:
+        '201':
+          description: บันทึกแล้ว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NoticeView' }
+        '409':
+          description: เคยบันทึกที่ระดับนี้ของ bucket นี้ไปแล้ว · ไม่ต้องส่งซ้ำ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                ซ้ำ:
+                  value:
+                    error:
+                      code: "NOTICE_ALREADY_SENT"
+                      message: "เคยแจ้งเตือน bucket นี้ที่ระดับ 7 วันไปแล้ว"
+                      requestId: "req_01J9X"
+        '422':
+          description: bucket หมดอายุไปแล้ว · แจ้งเตือนล่วงหน้าไม่ได้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    AsOf:
+      name: asOf
+      in: query
+      required: false
+      description: |
+        เวลาที่ใช้ตัดสินว่าก้อนไหนหมดอายุแล้ว · RFC 3339
+        ใส่ได้ทั้งอดีตและอนาคต · ค่าปริยายคือเวลาปัจจุบันของ server
+      schema: { type: string, format: date-time }
+      example: "2026-10-01T00:00:00Z"
+
+  schemas:
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: |
+        จำนวนเต็มในหน่วยเล็กสุด ส่งเป็น **string** เสมอ (RFD 14)
+      examples: ["600"]
+
+    Freshness:
+      type: object
+      description: |
+        projection ตามหลัง chain เสมอ · ค่าชุดนี้บอกว่าตามหลังแค่ไหน
+        หน้าเว็บที่ต้องการความแม่นยำสูงควรแสดงเวลาที่ข้อมูลอัปเดตล่าสุด
+      required: [asOfBlock, lagBlocks]
+      properties:
+        asOfBlock:
+          type: integer
+          description: block ล่าสุดที่ projection ประมวลผลไปแล้ว
+        lagBlocks:
+          type: integer
+          minimum: 0
+          description: ตามหลัง indexer อยู่กี่ block
+        lagSeconds:
+          type: [integer, 'null']
+          description: ประมาณเวลาที่ตามหลัง
+
+    Bucket:
+      type: object
+      required: [bucketId, amount, receivedAt, expiresAt, expired]
+      properties:
+        bucketId:   { type: string }
+        amount:     { $ref: '#/components/schemas/BaseUnits' }
+        receivedAt: { type: string, format: date-time }
+        expiresAt:
+          type: string
+          format: date-time
+          description: คำนวณจาก `genesisAt` และ `epochSeconds` ของ contract (RFD 10)
+        expired:
+          type: boolean
+          description: เทียบกับ `asOf` ที่ส่งมา ไม่ใช่กับเวลาปัจจุบัน
+
+    BalanceView:
+      type: object
+      required: [pointTypeId, holderKind, holderId, decimals, asOf, available, reserved, unexpiredTotal, buckets, freshness]
+      properties:
+        pointTypeId: { type: string }
+        holderKind:  { type: string, enum: [MERCHANT, CUSTOMER] }
+        holderId:    { type: string }
+        decimals:
+          type: integer
+          description: ใช้แปลงที่ชั้นแสดงผลเท่านั้น · ห้ามใช้คำนวณ (RFD 14)
+        asOf:
+          type: string
+          format: date-time
+          description: เวลาที่ใช้ตัดสิน · สะท้อนค่าที่ส่งมา หรือเวลาปัจจุบันถ้าไม่ส่ง
+        available:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: ยอดที่ยังไม่หมดอายุ ลบด้วยยอดที่ถูกกันไว้ · ติดลบไม่ได้
+        reserved:       { $ref: '#/components/schemas/BaseUnits' }
+        unexpiredTotal:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: ยอดที่ยังไม่หมดอายุ ก่อนหักที่กันไว้
+        buckets:
+          type: array
+          description: เรียงตามวันหมดอายุ ใกล้ที่สุดก่อน
+          items: { $ref: '#/components/schemas/Bucket' }
+        freshness: { $ref: '#/components/schemas/Freshness' }
+
+    ForecastDay:
+      type: object
+      required: [expiresOn, amount]
+      properties:
+        expiresOn: { type: string, format: date }
+        amount:    { $ref: '#/components/schemas/BaseUnits' }
+
+    ForecastView:
+      type: object
+      required: [pointTypeId, asOf, horizonDays, totalExpiring, days]
+      properties:
+        pointTypeId:   { type: string }
+        asOf:          { type: string, format: date-time }
+        horizonDays:   { type: integer }
+        totalExpiring: { $ref: '#/components/schemas/BaseUnits' }
+        days:
+          type: array
+          items: { $ref: '#/components/schemas/ForecastDay' }
+
+    NoticeRequest:
+      type: object
+      additionalProperties: false
+      required: [bucketId, thresholdDays, channel]
+      properties:
+        bucketId:      { type: string }
+        thresholdDays: { type: integer, enum: [30, 7, 1] }
+        channel:       { type: string, enum: [PUSH, EMAIL, SMS] }
+
+    NoticeView:
+      type: object
+      required: [noticeId, bucketId, thresholdDays, channel, notifiedAt]
+      properties:
+        noticeId:      { type: string }
+        bucketId:      { type: string }
+        thresholdDays: { type: integer }
+        channel:       { type: string }
+        notifiedAt:    { type: string, format: date-time }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_FAILED
+                - POINT_TYPE_NOT_FOUND
+                - BUCKET_NOT_FOUND
+                - BUCKET_ALREADY_EXPIRED
+                - NOTICE_ALREADY_SENT
+                - FORBIDDEN
+                - RATE_LIMITED
+            message:   { type: string }
+            requestId: { type: string }
+            details:   { type: object, additionalProperties: true }

@@ -1,0 +1,38 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> PENDING : รับคำขอ · event seq 1
+
+    PENDING --> SUBMITTED : ยิง tx ออกไป
+    PENDING --> MANUAL_REVIEW : มีอะไรผิดก่อนยิง
+
+    SUBMITTED --> CONFIRMED : เข้าบล็อกแล้ว
+    SUBMITTED --> CHAIN_REVERTED : tx revert
+    SUBMITTED --> ORPHANED : reorg · tx หลุดจาก chain
+    SUBMITTED --> MANUAL_REVIEW
+
+    CONFIRMED --> FINALIZED : ลึกพอที่จะถือว่าจบ
+    CONFIRMED --> ORPHANED : reorg · บล็อกที่เคยเห็นหายไป
+    CONFIRMED --> MANUAL_REVIEW
+
+    ORPHANED --> SUBMITTED : ยิงใหม่
+    ORPHANED --> MANUAL_REVIEW
+
+    MANUAL_REVIEW --> SUBMITTED : คนสั่งให้ลองใหม่
+    MANUAL_REVIEW --> CHAIN_REVERTED : คนสั่งให้ยกเลิก
+    MANUAL_REVIEW --> FINALIZED : คนยืนยันว่าสำเร็จ
+
+    note right of ORPHANED
+        CONFIRMED มาที่นี่ได้
+        ดูเหมือนถอยหลัง แต่ถูกต้อง
+        status จึงไม่ monotonic
+        client ต้องเทียบ seq ไม่ใช่ status
+    end note
+
+    note left of FINALIZED
+        ปลายทาง · เลิก poll
+        terminal ใน API เป็น true
+    end note
+
+    FINALIZED --> [*]
+    CHAIN_REVERTED --> [*]

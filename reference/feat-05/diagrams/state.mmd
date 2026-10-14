@@ -1,0 +1,27 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+stateDiagram-v2
+    direction LR
+    state "ยอดถูกกันไว้" as HELD
+    state "ปล่อยคืน · ยอดกลับมาใช้ได้" as BACK
+    state "ปล่อย · ยอดถูกหักจริงแล้ว" as SPENT
+    state "ยังกันไว้ · รอคนตัดสิน" as STUCK
+
+    [*] --> HELD : COMMIT ของ ADMIT สำเร็จ
+    HELD --> HELD : step ทยอย SUBMITTED และ CONFIRMED
+    HELD --> SPENT : ทุก step FINALIZED
+    HELD --> BACK : CHAIN_REVERTED
+    HELD --> STUCK : บาง step สำเร็จ บาง step ล้ม
+    STUCK --> SPENT : คนตัดสินว่าจบ
+    STUCK --> BACK : คนตัดสินว่ายกเลิก
+    SPENT --> [*]
+    BACK --> [*]
+    note right of HELD
+        ยอดที่ใช้ได้ลดลงทันทีที่ ADMIT
+        ไม่ต้องรอ chain
+        คำขออื่นจึงจองเกินไม่ได้
+    end note
+    note right of STUCK
+        trigger กันไม่ให้ปล่อยยอด
+        ตอนที่งานยังไม่จบ
+        MANUAL_REVIEW ก็ปล่อยไม่ได้
+    end note

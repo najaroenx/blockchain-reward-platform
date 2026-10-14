@@ -1,0 +1,277 @@
+// =====================================================================
+// FEAT-01 · Merchant Onboarding · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อใน DB เป็น snake_case
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum OperationKind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+
+  @@map("operation_kind")
+}
+
+enum OperationStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+
+  @@map("operation_status")
+}
+
+enum StepStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+
+  @@map("step_status")
+}
+
+/// PENDING = สมัครแล้วแต่ยังไม่ได้ provision บน chain
+/// ACTIVE เขียนได้จาก projector เท่านั้น (RFD 8 §3.4)
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+
+  @@map("merchant_status")
+}
+
+enum WalletOwner {
+  MERCHANT
+  CUSTOMER
+  PLATFORM
+
+  @@map("wallet_owner")
+}
+
+enum ActorType {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+
+  @@map("actor_type")
+}
+
+// ----------------------------------------------------------- ตัวร้านค้า
+model Merchant {
+  id          String         @id
+  name        String
+  status      MerchantStatus @default(PENDING)
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  activatedAt DateTime?      @map("activated_at") @db.Timestamptz(6)
+
+  admins MerchantAdmin[]
+
+  @@index([createdAt], map: "ix_merchant_pending")
+  @@map("merchant")
+}
+
+/// ร้านคือหน่วยที่ถือสินทรัพย์ · คนคือหน่วยที่ล็อกอิน · ร้านหนึ่งมีหลายแอดมิน
+model MerchantAdmin {
+  id              String    @id
+  merchantId      String    @map("merchant_id")
+  /// ค่าที่ผู้ใช้พิมพ์ · เก็บไว้แสดงกลับ
+  email           String
+  /// NFC + trim + lowercase · unique อยู่บนคอลัมน์นี้เท่านั้น
+  emailNormalized String    @map("email_normalized")
+  /// argon2id PHC string เต็มๆ · CHECK ใน migration.sql บังคับว่าต้องขึ้นต้น $argon2id$
+  passwordHash    String    @map("password_hash")
+  displayName     String    @map("display_name")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastLoginAt     DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+
+  @@unique([emailNormalized], map: "uq_admin_email")
+  @@index([merchantId], map: "ix_admin_merchant")
+  @@map("merchant_admin")
+}
+
+/// RFD 4 · L6 — ไม่มีคอลัมน์ private key ไม่มีวันมี
+/// keyRef ชี้ไป KMS เท่านั้น · พิสูจน์ด้วย tests/acceptance.sql T3
+model Wallet {
+  id        String      @id
+  address   Bytes
+  keyRef    String      @map("key_ref")
+  ownerKind WalletOwner @map("owner_kind")
+  ownerId   String      @map("owner_id")
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([address], map: "uq_wallet_address")
+  @@unique([ownerKind, ownerId], map: "uq_wallet_owner")
+  @@map("wallet")
+}
+
+/// signer ของระบบ จ่าย gas ยิง tx · คนละเรื่องกับ wallet ของร้าน
+/// RFD 4 L5 · ห้ามใช้ address ของระบบเดิม ไม่งั้น nonce ชนกัน
+model Signer {
+  address   Bytes    @id
+  keyRef    String   @map("key_ref")
+  nextNonce BigInt   @default(0) @map("next_nonce")
+  enabled   Boolean  @default(true)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  steps OperationStep[]
+
+  @@map("signer")
+}
+
+// --------------------------------------------- Group B · แกน write path
+/// RFD 3 · D1 — unique คือ (scope, key)
+/// ตอนสมัคร scope = anon:<sha256(normalized email)> เพราะยังไม่มี actor
+model IdempotencyKey {
+  id             String    @id
+  scope          String
+  key            String
+  fingerprint    Bytes
+  operationId    String?   @map("operation_id")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@index([expiresAt], map: "ix_idem_expiry")
+  @@map("idempotency_key")
+}
+
+model Operation {
+  id          String          @id
+  actorScope  String          @map("actor_scope")
+  kind        OperationKind
+  status      OperationStatus @default(PENDING)
+  /// merchantId สำหรับงาน provision · partial unique index กันสั่งซ้อน
+  subjectId   String?         @map("subject_id")
+  payload     Json
+  errorNote   String?         @map("error_note")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  finalizedAt DateTime?       @map("finalized_at") @db.Timestamptz(6)
+
+  steps           OperationStep[]
+  outbox          Outbox[]
+  events          OperationEvent[]
+  idempotencyKeys IdempotencyKey[]
+  chainEvents     ChainEvent[]
+
+  @@index([createdAt], map: "ix_operation_open")
+  @@map("operation")
+}
+
+/// RFD 2 · D4 — หนึ่งแถวต่อหนึ่ง chain tx
+/// provision มีสองขั้น: whitelistMerchant แล้ว setApprovalForAll
+model OperationStep {
+  id            String     @id
+  operationId   String     @map("operation_id")
+  stepIndex     Int        @map("step_index")
+  name          String
+  signerAddress Bytes?     @map("signer_address")
+  nonce         BigInt?
+  /// RFD 2 R2 · ต้อง COMMIT ก่อน broadcast เสมอ
+  rawTx         Bytes?     @map("raw_tx")
+  txHash        Bytes?     @map("tx_hash")
+  status        StepStatus @default(PENDING)
+  submittedAt   DateTime?  @map("submitted_at") @db.Timestamptz(6)
+  confirmedAt   DateTime?  @map("confirmed_at") @db.Timestamptz(6)
+  finalizedAt   DateTime?  @map("finalized_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  signer    Signer?   @relation(fields: [signerAddress], references: [address])
+
+  @@unique([operationId, stepIndex], map: "uq_step_order")
+  @@unique([txHash], map: "uq_step_txhash")
+  @@unique([signerAddress, nonce], map: "uq_signer_nonce")
+  @@map("operation_step")
+}
+
+/// RFD 2 · D1 — INSERT อยู่ใน transaction เดียวกับ INSERT operation เสมอ
+model Outbox {
+  id          String    @id
+  operationId String    @map("operation_id")
+  /// ต้องมีเวอร์ชันต่อท้าย เช่น merchant.provision.v1 (RFD 7 D9)
+  topic       String
+  payload     Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_outbox_pending")
+  @@map("outbox")
+}
+
+model OperationEvent {
+  id          String           @id
+  operationId String           @map("operation_id")
+  fromStatus  OperationStatus? @map("from_status")
+  toStatus    OperationStatus  @map("to_status")
+  actor       ActorType        @default(SYSTEM)
+  txHash      Bytes?           @map("tx_hash")
+  metadata    Json             @default("{}")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([operationId, createdAt], map: "ix_opevent_operation")
+  @@map("operation_event")
+}
+
+// -------------------------------------------- Group C · ฝั่งอ่าน chain
+model ChainEvent {
+  id             String    @id
+  blockNumber    BigInt    @map("block_number")
+  blockHash      Bytes     @map("block_hash")
+  txHash         Bytes     @map("tx_hash")
+  logIndex       Int       @map("log_index")
+  address        Bytes
+  topic0         Bytes
+  topics         Json      @default("[]")
+  data           Bytes
+  blockTimestamp DateTime  @map("block_timestamp") @db.Timestamptz(6)
+  operationId    String?   @map("operation_id")
+  orphanedAt     DateTime? @map("orphaned_at") @db.Timestamptz(6)
+  appliedAt      DateTime? @map("applied_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([txHash, logIndex], map: "uq_chain_event")
+  @@map("chain_event")
+}
+
+/// RFD 5 · L8 — indexer รัน instance เดียว · cursor ขยับใน transaction เดียวกับ insert
+model IndexerCursor {
+  contractAddress Bytes    @id @map("contract_address")
+  lastBlock       BigInt   @map("last_block")
+  lastBlockHash   Bytes?   @map("last_block_hash")
+  updatedAt       DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("indexer_cursor")
+}

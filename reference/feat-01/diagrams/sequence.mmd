@@ -1,0 +1,85 @@
+%%{init:{'theme':'base','themeVariables':{
+'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif',
+'actorBkg':'#ffffff','actorBorder':'#5c6672','actorTextColor':'#1b1f24','actorLineColor':'#c9ced6',
+'signalColor':'#5c6672','signalTextColor':'#1b1f24',
+'labelBoxBkgColor':'#f2f4f6','labelBoxBorderColor':'#5c6672','labelTextColor':'#1b1f24',
+'noteBkgColor':'#fdf6f2','noteBorderColor':'#eb6c36','noteTextColor':'#5a4034',
+'activationBkgColor':'#eef1f4','activationBorderColor':'#5c6672',
+'sequenceNumberColor':'#ffffff'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant A as api
+    participant K as KMS
+    participant D as PostgreSQL
+    participant W as worker
+    participant N as chain
+    participant I as indexer
+
+    Note over C,K: เตรียมของ · ยังไม่เปิด transaction
+    C->>+A: POST /v1/merchants · Idempotency-Key · { name, admin }
+    A->>A: ไม่มี header → 400 · ไม่สร้างให้เอง
+    A->>A: normalize email · NFC → trim → lowercase
+    A->>A: scope = anon:sha256(email ที่ normalize แล้ว)
+    A->>A: fingerprint = sha256(canonical DTO) · ไม่มี salt
+    A->>A: argon2id hash password · กินเวลาหลักร้อย ms
+    A->>+K: createKey merchant:<email>
+    K-->>-A: { address, key_ref } · private key ไม่เคยออกจาก KMS
+
+    rect rgb(248,249,250)
+    Note over A,D: ADMIT · transaction เดียว · ทุกแถวหรือไม่มีเลย
+    A->>+D: BEGIN
+    A->>D: INSERT idempotency_key ON CONFLICT DO NOTHING
+    alt 0 rows · เคยเห็น key นี้
+        D-->>A: แถวเดิม
+        A->>A: fingerprint ต่าง → 409 · ตรง → replay response เดิม
+    else 1 row · ครั้งแรก
+        A->>D: INSERT merchant · status PENDING
+        A->>D: INSERT merchant_admin · argon2id hash
+        Note right of D: uq_admin_email บน email_normalized<br/>อีเมลซ้ำชนตรงนี้ → 409
+        A->>D: INSERT wallet · address + key_ref · ไม่มีคอลัมน์ private key
+        A->>D: INSERT operation MERCHANT_PROVISION · PENDING
+        A->>D: INSERT operation_step 1 whitelist · 2 setApprovalForAll
+        A->>D: INSERT outbox · merchant.provision.v1
+        A->>D: UPDATE idempotency_key SET response 201
+        D-->>-A: COMMIT
+    end
+    end
+
+    A-->>-C: 201 { merchantId, wallet.address, provisioning.operationId }
+    Note over C,A: ร้านมีตัวตนแล้ว ล็อกอินได้ · แต่ยังออก point/coupon ไม่ได้
+
+    Note over W,N: PROVISION · worker · เป็นงานแยกที่ตามมา
+    W->>+D: claim outbox WHERE sent_at IS NULL FOR UPDATE SKIP LOCKED
+    D-->>-W: operation
+    W->>D: SELECT next_nonce FROM signer FOR UPDATE
+    W->>W: build raw_tx · whitelistMerchant(address)
+    W->>+K: sign ด้วย key_ref ของ signer
+    K-->>-W: signed raw_tx
+    W->>D: UPDATE step 1 SET raw_tx nonce · COMMIT ก่อน broadcast
+    W->>+N: eth_sendRawTransaction
+    N-->>-W: tx_hash
+    W->>D: UPDATE step 1 → SUBMITTED
+
+    Note over I,N: OBSERVE · indexer · instance เดียว
+    I->>+N: eth_getLogs fromBlock = cursor
+    N-->>-I: logs
+    I->>D: INSERT chain_event ON CONFLICT (tx_hash, log_index) DO NOTHING
+    I->>D: UPDATE indexer_cursor · transaction เดียวกัน
+
+    Note over W,D: step 1 FINALIZED แล้วจึงเริ่ม step 2
+    W->>D: step 1 → FINALIZED เมื่อผ่าน N block และ block_hash ยังอยู่
+    W->>+N: setApprovalForAll
+    N-->>-W: tx_hash
+    alt ทั้งสอง step FINALIZED
+        W->>D: merchant → ACTIVE · activated_at = now()
+        W->>D: operation → FINALIZED · INSERT webhook_delivery
+        Note right of W: ACTIVE เขียนได้จาก projector เท่านั้น
+    else step ใด step หนึ่งล้ม
+        W->>D: operation → CHAIN_REVERTED หรือ MANUAL_REVIEW
+        Note right of W: ร้านยังอยู่ที่ PENDING<br/>ข้อมูลไม่หาย สั่ง provision ใหม่ได้
+    end
+
+    C->>+A: GET /v1/merchants/id
+    A->>D: SELECT merchant · อ่าน projection ไม่อ่าน chain
+    A-->>-C: { status ACTIVE, wallet.ready true }

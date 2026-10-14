@@ -1,0 +1,369 @@
+// =====================================================================
+// FEAT-08 · List on Marketplace · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อใน DB เป็น snake_case
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum OperationKind {
+  MERCHANT_PROVISION
+  POINT_TYPE_CREATE
+  POINT_TRANSFER
+  COUPON_TYPE_CREATE
+  COUPON_ISSUE
+  COUPON_REDEEM
+  LISTING_CREATE
+  LISTING_DELETE
+  LISTING_BUY
+  THB_MINT
+
+  @@map("operation_kind")
+}
+
+enum OperationStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+  MANUAL_REVIEW
+
+  @@map("operation_status")
+}
+
+enum StepStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FINALIZED
+  CHAIN_REVERTED
+  ORPHANED
+
+  @@map("step_status")
+}
+
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+
+  @@map("merchant_status")
+}
+
+enum CouponTypeStatus {
+  REQUESTED
+  LIVE
+  FAILED
+  RETIRED
+
+  @@map("coupon_type_status")
+}
+
+enum CouponCodeState {
+  ISSUED
+  HELD
+  REDEEMED
+  EXPIRED
+  VOIDED
+
+  @@map("coupon_code_state")
+}
+
+enum HolderKind {
+  MERCHANT
+  CUSTOMER
+
+  @@map("holder_kind")
+}
+
+enum ListingStatus {
+  PENDING
+  ACTIVE
+  SOLD
+  DELISTED
+  FAILED
+
+  @@map("listing_status")
+}
+
+/// RFD 12 D3 · ชนิดที่เป็นของชิ้นเดียวถูกบังคับด้วย partial unique index
+enum ReservationSubject {
+  POINT_BALANCE
+  COUPON_UNIT
+  LISTING
+  THB_BALANCE
+  ESCROW
+
+  @@map("reservation_subject")
+}
+
+enum ActorType {
+  SYSTEM
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+
+  @@map("actor_type")
+}
+
+// ---------------------------------------------- ตัวตน (FEAT-01 · FEAT-07)
+model Merchant {
+  id        String         @id
+  name      String
+  status    MerchantStatus @default(PENDING)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  couponTypes CouponType[]
+
+  @@map("merchant")
+}
+
+model Signer {
+  address   Bytes   @id
+  keyRef    String  @map("key_ref")
+  nextNonce BigInt  @default(0) @map("next_nonce")
+  enabled   Boolean @default(true)
+
+  steps OperationStep[]
+
+  @@map("signer")
+}
+
+model CouponType {
+  id          String           @id
+  merchantId  String           @map("merchant_id")
+  name        String
+  faceValue   Decimal          @map("face_value") @db.Decimal(78, 0)
+  totalSupply Int              @map("total_supply")
+  status      CouponTypeStatus @default(REQUESTED)
+  expiresAt   DateTime         @map("expires_at") @db.Timestamptz(6)
+
+  merchant Merchant     @relation(fields: [merchantId], references: [id])
+  codes    CouponCode[]
+  listings Listing[]
+
+  @@map("coupon_type")
+}
+
+model CouponCode {
+  id           String          @id
+  couponTypeId String          @map("coupon_type_id")
+  codeHash     Bytes           @map("code_hash")
+  codeRef      Bytes           @map("code_ref")
+  state        CouponCodeState @default(ISSUED)
+  holderKind   HolderKind?     @map("holder_kind")
+  holderId     String?         @map("holder_id")
+
+  couponType CouponType    @relation(fields: [couponTypeId], references: [id])
+  items      ListingItem[]
+
+  @@unique([codeHash], map: "uq_code_hash")
+  @@unique([codeRef], map: "uq_code_ref")
+  @@index([holderKind, holderId], map: "ix_code_holder")
+  @@map("coupon_code")
+}
+
+// ======================================================= รายการขาย
+/// ฝั่งคำขอของร้าน · ราคาและจำนวนมาจากร้าน ไม่ได้มาจาก chain
+model Listing {
+  id           String        @id
+  sellerKind   HolderKind    @map("seller_kind")
+  sellerId     String        @map("seller_id")
+  couponTypeId String        @map("coupon_type_id")
+  /// RFD 14 · ราคาต่อใบ เป็น base units ของ THB
+  unitPrice    Decimal       @map("unit_price") @db.Decimal(78, 0)
+  quantity     Int
+  status       ListingStatus @default(PENDING)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  activeAt     DateTime?     @map("active_at") @db.Timestamptz(6)
+  closedAt     DateTime?     @map("closed_at") @db.Timestamptz(6)
+
+  couponType CouponType    @relation(fields: [couponTypeId], references: [id])
+  items      ListingItem[]
+  chain      ListingChain?
+
+  @@index([sellerKind, sellerId, status], map: "ix_listing_seller")
+  @@index([couponTypeId, unitPrice], map: "ix_listing_browse")
+  @@map("listing")
+}
+
+/// ของที่ลงขายคือใบที่ระบุเจาะจง ไม่ใช่จำนวน
+/// ขาย 5 จาก 10 ใบจึงเป็นเรื่องธรรมดา และบอกได้ว่าใบไหนบ้าง
+///
+/// trigger trg_listing_item_valid ตรวจทุกใบว่า
+///   อยู่สถานะ HELD · อยู่ในมือผู้ขาย · ประเภทตรงกัน · ยังไม่หมดอายุ
+/// trigger trg_listing_quantity_match กันไม่ให้ใส่เกิน quantity ที่ประกาศ
+model ListingItem {
+  id           String @id
+  listingId    String @map("listing_id")
+  couponCodeId String @map("coupon_code_id")
+
+  listing Listing    @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  code    CouponCode @relation(fields: [couponCodeId], references: [id])
+
+  @@unique([listingId, couponCodeId], map: "uq_item_in_listing")
+  @@index([couponCodeId], map: "ix_item_code")
+  @@map("listing_item")
+}
+
+/// ฝั่งผลจาก chain · projection แท้ (RFD 6 §3.2)
+/// trigger trg_listing_chain_immutable กันไม่ให้แก้ค่าหลังเขียน
+model ListingChain {
+  listingId       String   @id @map("listing_id")
+  contractAddress Bytes    @map("contract_address")
+  chainListingId  Decimal  @map("chain_listing_id") @db.Decimal(78, 0)
+  createdBlock    BigInt   @map("created_block")
+  createdTxHash   Bytes    @map("created_tx_hash")
+  appliedAt       DateTime @default(now()) @map("applied_at") @db.Timestamptz(6)
+
+  listing Listing @relation(fields: [listingId], references: [id])
+
+  @@unique([contractAddress, chainListingId], map: "uq_listing_chain")
+  @@map("listing_chain")
+}
+
+// --------------------------------------------- Group B · แกน write path
+model IdempotencyKey {
+  id             String    @id
+  scope          String
+  key            String
+  fingerprint    Bytes
+  operationId    String?   @map("operation_id")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([scope, key], map: "uq_idem")
+  @@map("idempotency_key")
+}
+
+model Operation {
+  id          String          @id
+  actorScope  String          @map("actor_scope")
+  kind        OperationKind
+  status      OperationStatus @default(PENDING)
+  /// listingId · partial unique index กันสั่งงานซ้อนกับรายการเดิม
+  subjectId   String?         @map("subject_id")
+  payload     Json
+  errorNote   String?         @map("error_note")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  finalizedAt DateTime?       @map("finalized_at") @db.Timestamptz(6)
+
+  steps           OperationStep[]
+  outbox          Outbox[]
+  reservations    Reservation[]
+  events          OperationEvent[]
+  idempotencyKeys IdempotencyKey[]
+  chainEvents     ChainEvent[]
+
+  @@index([createdAt], map: "ix_operation_open")
+  @@map("operation")
+}
+
+/// ลงขาย = สาม tx ที่ต้องเรียงกัน · นี่คือเหตุผลที่ตารางนี้ต้องมี (RFD 2 D4)
+///   1 approveCoupon · 2 createListing · 3 lockInVault
+model OperationStep {
+  id            String     @id
+  operationId   String     @map("operation_id")
+  stepIndex     Int        @map("step_index")
+  name          String
+  signerAddress Bytes?     @map("signer_address")
+  nonce         BigInt?
+  /// RFD 2 R2 · ต้อง COMMIT ก่อน broadcast เสมอ
+  rawTx         Bytes?     @map("raw_tx")
+  txHash        Bytes?     @map("tx_hash")
+  status        StepStatus @default(PENDING)
+  submittedAt   DateTime?  @map("submitted_at") @db.Timestamptz(6)
+  confirmedAt   DateTime?  @map("confirmed_at") @db.Timestamptz(6)
+  finalizedAt   DateTime?  @map("finalized_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  signer    Signer?   @relation(fields: [signerAddress], references: [address])
+
+  @@unique([operationId, stepIndex], map: "uq_step_order")
+  @@unique([txHash], map: "uq_step_txhash")
+  @@unique([signerAddress, nonce], map: "uq_signer_nonce")
+  @@map("operation_step")
+}
+
+model Outbox {
+  id          String    @id
+  operationId String    @map("operation_id")
+  topic       String
+  payload     Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_outbox_pending")
+  @@map("outbox")
+}
+
+/// uq_reservation_exclusive (partial unique index ใน migration.sql)
+/// ทำให้คูปองใบเดียวกันอยู่ในสองรายการขายพร้อมกันเป็นไปไม่ได้
+/// trigger trg_reservation_release_timing กันไม่ให้ปล่อยจองก่อนงานจบ
+model Reservation {
+  id          String             @id
+  operationId String             @map("operation_id")
+  subjectType ReservationSubject @map("subject_type")
+  subjectId   String             @map("subject_id")
+  amount      Decimal            @db.Decimal(78, 0)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  releasedAt  DateTime?          @map("released_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([subjectType, subjectId], map: "ix_reservation_open")
+  @@map("reservation")
+}
+
+model OperationEvent {
+  id          String           @id
+  operationId String           @map("operation_id")
+  fromStatus  OperationStatus? @map("from_status")
+  toStatus    OperationStatus  @map("to_status")
+  actor       ActorType        @default(SYSTEM)
+  txHash      Bytes?           @map("tx_hash")
+  metadata    Json             @default("{}")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@map("operation_event")
+}
+
+// -------------------------------------------- Group C · ฝั่งอ่าน chain
+model ChainEvent {
+  id             String    @id
+  blockNumber    BigInt    @map("block_number")
+  blockHash      Bytes     @map("block_hash")
+  txHash         Bytes     @map("tx_hash")
+  logIndex       Int       @map("log_index")
+  address        Bytes
+  topic0         Bytes
+  topics         Json      @default("[]")
+  data           Bytes
+  blockTimestamp DateTime  @map("block_timestamp") @db.Timestamptz(6)
+  operationId    String?   @map("operation_id")
+  orphanedAt     DateTime? @map("orphaned_at") @db.Timestamptz(6)
+  appliedAt      DateTime? @map("applied_at") @db.Timestamptz(6)
+
+  operation Operation? @relation(fields: [operationId], references: [id])
+
+  @@unique([txHash, logIndex], map: "uq_chain_event")
+  @@map("chain_event")
+}

@@ -1,0 +1,413 @@
+openapi: 3.1.0
+info:
+  title: FEAT-12 · THB Deposit & Mint
+  version: 1.0.0
+  description: |
+    เงินบาทจริงเข้ามา แล้ว THB บน chain ถูกสร้างขึ้นเท่ากันพอดี
+
+    ## คำถามของ feature นี้
+
+    ไม่ใช่ "mint อย่างไร" แต่เป็น **"อะไรทำให้การ mint ครั้งหนึ่งถูกต้อง"**
+
+    `F4` — `autoMintIfNeeded` ของระบบเดิมเสก THB ด้วย admin key เมื่อยอดไม่พอ
+    ไม่มีเงินบาทจริงอยู่เบื้องหลัง และไม่มีใครรู้ว่าเสกไปเท่าไร
+
+    คำตอบที่นี่ — การ mint ต้องมีแถว `thb_deposit` ที่ `CONFIRMED` รองรับ
+    หนึ่งต่อหนึ่ง ยอดตรงกันพอดี และปลายทางต้องเป็นเจ้าของการฝากนั้น
+    ทั้งสามข้อตรวจที่ `trg_mint_requires_confirmed_deposit`
+
+    `FEAT-10` ตั้งกฎว่าค่าติดลบของบัญชี `ISSUANCE` เท่ากับ THB ที่หมุนอยู่
+    ในระบบทั้งหมด · `FEAT-12` คือที่เดียวที่ `ISSUANCE` ขยับได้
+    `trg_issuance_only_from_mint` ปฏิเสธ `ledger_entry` ที่แตะ `ISSUANCE`
+    จาก operation ที่ `kind` ไม่ใช่ `THB_MINT`
+
+    ## เงินเข้าธนาคาร กับ THB ปรากฏบน chain เป็นสองเรื่อง
+
+    จึงเป็นสองตาราง สองสถานะ และข้ามขั้นไม่ได้
+
+    ```text
+    PENDING_PAYMENT → CONFIRMED → MINTED
+                    ↘ FAILED
+                    ↘ EXPIRED
+                                   ↘ REVERSED
+    ```
+
+    ## Idempotency ของ feature นี้มาจากข้างนอก
+
+    ต่าง endpoint อื่นทั้งหมด — ที่นี่ผู้ให้บริการชำระเงินเป็นคนเลือกคีย์
+    ไม่ใช่เรา · `provider_event_id` ของ webhook และ `provider_ref`
+    ของการฝาก เป็น `UNIQUE` ทั้งคู่ · ผู้ให้บริการส่งซ้ำกี่รอบก็ประมวลผลครั้งเดียว
+
+    `Idempotency-Key` ยังใช้กับ `POST /v1/deposits` ที่ลูกค้าเรียกเอง
+
+    ## ลายเซ็น webhook ใช้ HMAC และนั่นถูกต้อง
+
+    `L7` / `SPEC-001 [IK-23]` ห้ามใช้ salt / secret / HMAC — แต่ข้อนั้น
+    พูดถึง **fingerprint ของ idempotency key** เท่านั้น ไม่ได้ห้ามใช้ HMAC
+    ตรวจลายเซ็น webhook ซึ่งเป็นงานที่ HMAC ถูกออกแบบมาเพื่อ
+
+    อ่าน `[IK-23]` กว้างเกินจะได้ webhook ที่ไม่ตรวจอะไรเลย
+
+servers:
+  - url: https://api.example.com
+    description: production
+
+tags:
+  - name: deposits
+    description: ฝากเงินบาทและดูสถานะ
+  - name: webhooks
+    description: ผู้ให้บริการชำระเงินเรียกเข้ามา
+
+paths:
+  /v1/deposits:
+    post:
+      tags: [deposits]
+      summary: สร้างรายการฝากเงิน
+      operationId: createDeposit
+      security:
+        - bearerAuth: []
+      description: |
+        คืน `paymentUrl` ให้ลูกค้าไปจ่าย · ยังไม่มี THB เกิดขึ้นในขั้นนี้
+
+        `amountSatang` เป็นหน่วยเล็กสุดของเงินบาทจริง (1/100 บาท)
+        ส่งเป็น **string** เหมือนจำนวนเงินทุกตัวในระบบ
+
+        รายการที่ไม่ถูกจ่ายภายใน `expiresAt` จะกลายเป็น `EXPIRED`
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateDepositRequest' }
+      responses:
+        '201':
+          description: สร้างรายการแล้ว · รอจ่ายเงิน
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepositCreated' }
+        '200':
+          description: คำขอเดิมด้วย key เดิม · คืนคำตอบที่บันทึกไว้
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepositCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/deposits/{depositId}:
+    get:
+      tags: [deposits]
+      summary: สถานะของการฝากหนึ่งรายการ
+      operationId: getDeposit
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: depositId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^dep_[A-Za-z0-9]{6,}$' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepositView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/webhooks/psp/{provider}:
+    post:
+      tags: [webhooks]
+      summary: ผู้ให้บริการชำระเงินแจ้งผล
+      operationId: receivePspWebhook
+      security: []
+      description: |
+        ### ลำดับการทำงาน · ลำดับนี้สำคัญ
+
+        1. อ่าน body **ดิบ** ก่อน parse — ตรวจลายเซ็นจาก byte ที่ได้มาจริง
+           parse แล้ว serialize ใหม่จะได้ byte คนละชุดและลายเซ็นจะไม่ตรง
+        2. ตรวจ HMAC กับ secret ของผู้ให้บริการ
+        3. เขียนแถว `psp_webhook` พร้อม `signature_ok`
+           **เขียนทั้งที่ลายเซ็นไม่ผ่าน** — เพื่อให้เห็นว่ามีคนยิงเข้ามา
+           แต่ `ix_psp_unprocessed` กรองแถวที่ไม่ผ่านออกจากคิวงานที่ระดับ schema
+        4. ถ้าลายเซ็นผ่าน จึงประมวลผลตามชนิด event
+
+        ### คำตอบ
+
+        คืน `200` ทั้งกรณีที่รับไว้และกรณีที่เห็นซ้ำ — ผู้ให้บริการส่วนใหญ่
+        จะ retry เมื่อได้อะไรที่ไม่ใช่ 2xx และการ retry ไม่ช่วยอะไร
+        เมื่อเราประมวลผลไปแล้ว
+
+        คืน `401` เมื่อลายเซ็นไม่ผ่าน · แถวยังถูกบันทึกไว้เพื่อตรวจสอบย้อนหลัง
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [omise, scb, kbank] }
+        - name: X-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 ของ body ดิบ ด้วย secret ของผู้ให้บริการ
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PspEvent' }
+      responses:
+        '200':
+          description: |
+            รับไว้แล้ว หรือเห็น event นี้มาก่อนแล้ว · ไม่ต้องส่งซ้ำ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookAck' }
+        '401':
+          description: ลายเซ็นไม่ผ่าน · บันทึกไว้แล้วแต่ไม่ประมวลผล
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/balance:
+    get:
+      tags: [deposits]
+      summary: ยอด THB ของผู้เรียก
+      operationId: getBalance
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        `SPEC-001` · UUID v4 · เก็บไว้ 72 ชั่วโมง
+
+        `[IK-23]` — fingerprint เป็น hash ตรงๆ ของ body
+        **ห้ามใช้ salt / secret / HMAC**
+      schema: { type: string, minLength: 8, maxLength: 255 }
+
+  schemas:
+    Satang:
+      type: string
+      pattern: '^[1-9][0-9]*$'
+      description: |
+        หน่วยเล็กสุดของเงินบาทจริง · 1 บาท = 100 สตางค์
+        string เสมอ · 100.50 บาท คือ `"10050"`
+      examples: ['10050']
+
+    BaseUnits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: |
+        หน่วยเล็กสุดบน chain · 1 บาท = 10^18
+
+        ตัวคูณระหว่างสองหน่วยคือ **10^16** คงที่
+        `trg_deposit_amount_exact` ตรวจทุกแถวว่าแปลงกันพอดี
+        รอยต่อนี้คือที่ที่บั๊กผิดหลักสิบยกกำลังมักเกิด
+      examples: ['100500000000000000000']
+
+    DepositStatus:
+      type: string
+      enum: [PENDING_PAYMENT, CONFIRMED, MINTED, REVERSED, FAILED, EXPIRED]
+      description: |
+        | สถานะ | ความหมาย |
+        |---|---|
+        | `PENDING_PAYMENT` | สร้างรายการแล้ว รอเงินเข้า · ยังไม่มี THB |
+        | `CONFIRMED` | ผู้ให้บริการยืนยันว่าเงินเข้าแล้ว · mint ได้ |
+        | `MINTED` | THB ถูกสร้างบน chain แล้ว |
+        | `REVERSED` | ถูกตีกลับหลัง mint ไปแล้ว |
+        | `FAILED` | จ่ายไม่สำเร็จ · ไม่เคยมีเงินเข้า |
+        | `EXPIRED` | หมดเวลารอจ่าย |
+
+    ReversalOutcome:
+      type: string
+      enum: [BURNED, MANUAL_REVIEW]
+      description: |
+        เลือกเองไม่ได้ · ต้องตรงกับยอดที่ใช้ได้จริงตอนนั้น
+        `trg_reversal_outcome_matches_balance` ปฏิเสธทั้งสองทิศทาง
+
+    CreateDepositRequest:
+      type: object
+      required: [amountSatang]
+      additionalProperties: false
+      properties:
+        amountSatang:
+          allOf: [{ $ref: '#/components/schemas/Satang' }]
+          description: ขั้นต่ำ 2000 สตางค์ (20 บาท) · สูงสุด 5000000 (50000 บาท)
+
+    DepositCreated:
+      type: object
+      required: [depositId, amountSatang, amountBase, status, paymentUrl, expiresAt]
+      properties:
+        depositId: { type: string, pattern: '^dep_[A-Za-z0-9]{6,}$' }
+        amountSatang: { $ref: '#/components/schemas/Satang' }
+        amountBase:
+          allOf: [{ $ref: '#/components/schemas/BaseUnits' }]
+          description: จำนวน THB ที่จะถูก mint เมื่อเงินเข้า · ไม่มากไม่น้อยกว่านี้
+        status: { type: string, const: PENDING_PAYMENT }
+        paymentUrl: { type: string, format: uri }
+        expiresAt: { type: string, format: date-time }
+
+    DepositView:
+      type: object
+      required: [depositId, amountSatang, amountBase, status, createdAt,
+                 confirmedAt, mintedAt, mint, reversal]
+      properties:
+        depositId: { type: string }
+        amountSatang: { $ref: '#/components/schemas/Satang' }
+        amountBase: { $ref: '#/components/schemas/BaseUnits' }
+        status: { $ref: '#/components/schemas/DepositStatus' }
+        createdAt: { type: string, format: date-time }
+        confirmedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        mintedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        mint:
+          oneOf: [{ $ref: '#/components/schemas/MintView' }, { type: 'null' }]
+        reversal:
+          oneOf: [{ $ref: '#/components/schemas/ReversalView' }, { type: 'null' }]
+
+    MintView:
+      type: object
+      required: [operationId, amountBase, txHash, mintedBlock]
+      properties:
+        operationId: { type: string, pattern: '^op_[A-Za-z0-9]{6,}$' }
+        amountBase: { $ref: '#/components/schemas/BaseUnits' }
+        txHash:
+          oneOf: [{ type: string, pattern: '^0x[0-9a-f]{64}$' }, { type: 'null' }]
+        mintedBlock:
+          oneOf: [{ type: integer, minimum: 1 }, { type: 'null' }]
+
+    ReversalView:
+      type: object
+      required: [amountBase, outcome, createdAt]
+      properties:
+        amountBase: { $ref: '#/components/schemas/BaseUnits' }
+        outcome: { $ref: '#/components/schemas/ReversalOutcome' }
+        note:
+          oneOf: [{ type: string }, { type: 'null' }]
+        createdAt: { type: string, format: date-time }
+
+    PspEvent:
+      type: object
+      required: [id, type, data]
+      properties:
+        id:
+          type: string
+          description: |
+            id ของ event ฝั่งผู้ให้บริการ · เป็น idempotency key ตัวจริง
+            เก็บเป็น `UNIQUE (provider, provider_event_id)`
+        type:
+          type: string
+          enum: [charge.complete, charge.failed, charge.reverse]
+        data:
+          type: object
+          required: [reference, amountSatang]
+          properties:
+            reference:
+              type: string
+              description: '`provider_ref` ของการฝาก · `UNIQUE (provider, provider_ref)`'
+            amountSatang:
+              allOf: [{ $ref: '#/components/schemas/Satang' }]
+              description: |
+                ต้องตรงกับยอดที่บันทึกไว้ · ไม่ตรงคือสัญญาณว่ามีอะไรผิด
+                ไม่ใช่สัญญาณให้แก้ยอดตาม · การฝากที่ยืนยันแล้วแก้ยอดไม่ได้
+
+    WebhookAck:
+      type: object
+      required: [received, duplicate]
+      properties:
+        received: { type: boolean }
+        duplicate:
+          type: boolean
+          description: 'true = เห็น event นี้มาก่อนแล้ว · ไม่ต้องส่งซ้ำ'
+
+    BalanceView:
+      type: object
+      required: [asset, amount, reserved, available]
+      properties:
+        asset: { type: string, const: THB }
+        amount: { $ref: '#/components/schemas/BaseUnits' }
+        reserved: { $ref: '#/components/schemas/BaseUnits' }
+        available: { $ref: '#/components/schemas/BaseUnits' }
+
+    ErrorCode:
+      type: string
+      enum:
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - IDEMPOTENCY_KEY_IN_PROGRESS
+        - VALIDATION_FAILED
+        - AMOUNT_OUT_OF_RANGE
+        - DEPOSIT_NOT_FOUND
+        - DEPOSIT_NOT_CONFIRMED
+        - DEPOSIT_ALREADY_MINTED
+        - AMOUNT_MISMATCH
+        - SIGNATURE_INVALID
+        - FORBIDDEN
+        - RATE_LIMITED
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string }
+            requestId: { type: string }
+            details: { type: object, additionalProperties: true }
+
+  responses:
+    BadRequest:
+      description: คำขอไม่ถูกรูป · ไม่มี `Idempotency-Key`
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: token ไม่ถูกต้องหรือหมดอายุ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: ไม่พบการฝาก หรือไม่ใช่ของผู้เรียก
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        | code | เมื่อไร |
+        |---|---|
+        | `AMOUNT_OUT_OF_RANGE` | ยอดต่ำกว่าขั้นต่ำหรือเกินเพดาน |
+        | `DEPOSIT_NOT_CONFIRMED` | สั่ง mint การฝากที่ยังไม่ยืนยัน (`F4`) |
+        | `DEPOSIT_ALREADY_MINTED` | การฝากนี้ mint ไปแล้ว |
+        | `AMOUNT_MISMATCH` | ยอดที่ webhook แจ้งไม่ตรงกับที่บันทึกไว้ |
+        | `IDEMPOTENCY_KEY_REUSED` | key เดิมแต่ body คนละชุด |
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    RateLimited:
+      description: เรียกถี่เกินไป · ลองใหม่ได้
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }

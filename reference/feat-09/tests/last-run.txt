@@ -1,0 +1,42 @@
+  #  |                      ข้อรับประกัน                       |  ผล  
+-----+------------------------------------------------------+------
+ T1  | ถอดซ้ำด้วย key เดิม → แถวที่สองได้ 0 rows                  | PASS
+ T2  | ถอดรายการ ACTIVE ของตัวเอง → ยอมรับ                    | PASS
+ T3  | F5 · ถอดรายการของร้านอื่น → ถูกปฏิเสธ                     | PASS
+ T4  | F5 · ถอดรายการที่ไม่มีอยู่ → ถูกปฏิเสธ ไม่ใช่กรอกเจ้าของให้      | PASS
+ T5  | ถอดโดยไม่ระบุ subject_id → ถูกปฏิเสธ                     | PASS
+ T6  | ลูกค้าถอดรายการของร้าน → ถูกปฏิเสธ                        | PASS
+ T7  | admin ถอดได้ทุกใบ · operation_event บันทึกว่าใครสั่ง        | PASS
+ T8  | actor_scope ไม่มี prefix → ถูกปฏิเสธ                     | PASS
+ T9  | ถอดรายการที่ยัง PENDING → ถูกปฏิเสธ                       | PASS
+ T10 | ถอดรายการที่ SOLD แล้ว → ถูกปฏิเสธ                        | PASS
+ T11 | ถอดรายการที่ DELISTED แล้ว → ถูกปฏิเสธ                    | PASS
+ T12 | ถอดใบเดิมซ้ำต่าง key → ชน uq_listing_inflight           | PASS
+ T13 | กดถอดขณะมี LISTING_BUY ค้าง → ถูกปฏิเสธ                  | PASS
+ T14 | มีงาน MANUAL_REVIEW ค้าง → ถอดไม่ได้                     | PASS
+ T15 | งานซื้อที่ CHAIN_REVERTED → ร้านถอดได้                     | PASS
+ T16 | ถอด = 2 step เรียงกัน cancelListing → releaseFromVault | PASS
+ T17 | step_index ซ้ำ → ชน uq_step_order                     | PASS
+ T18 | ยิง releaseFromVault ก่อน cancelListing จบ → ถูกปฏิเสธ   | PASS
+ T19 | ขั้นที่ 1 FINALIZED แล้ว → ขั้นที่ 2 ยิงได้                     | PASS
+ T20 | R2 · SUBMITTED โดยไม่มี raw_tx → ถูกปฏิเสธ               | PASS
+ T21 | ปล่อยคูปองขณะรายการยัง ACTIVE → ถูกปฏิเสธ                 | PASS
+ T22 | ปิดเป็น DELISTED แล้ว → ปล่อยจองได้ทั้ง 4 แถว               | PASS
+ T23 | ปิดรายการ → closed_at ถูกเติมและไม่ก่อนหน้า active_at      | PASS
+ T24 | ถอดเสร็จ · คูปองยัง HELD กับร้านเดิม ไม่เปลี่ยน state         | PASS
+ T25 | ถอดแล้วลงขายใบเดิมใหม่ได้ · จองใหม่ผ่าน                    | PASS
+ T26 | DELISTED → ACTIVE → ถูกปฏิเสธ                          | PASS
+ T27 | ซื้อตัดหน้า · ถอด CHAIN_REVERTED → รายการเป็น SOLD        | PASS
+ T28 | close_reason SOLD → CANCELLED → ถูกปฏิเสธ              | PASS
+ T29 | outbox topic ไม่มี .vN → ถูกปฏิเสธ                       | PASS
+ T30 | outbox ที่ส่งแล้วไม่ถูกหยิบซ้ำ                               | PASS
+ T31 | tx_hash ซ้ำข้าม operation → ถูกปฏิเสธ                    | PASS
+ T32 | nonce ซ้ำของ signer เดียวกัน → ถูกปฏิเสธ                  | PASS
+ T33 | แก้ chain_listing_id → ถูกปฏิเสธ                        | PASS
+ T34 | อ่าน log ช่วงเดิมซ้ำ → chain_event ไม่เกิดแถวซ้ำ            | PASS
+(34 rows)
+
+ ผ่าน | ไม่ผ่าน 
+-----+-------
+  34 |     0
+(1 row)

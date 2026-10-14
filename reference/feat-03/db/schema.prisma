@@ -1,0 +1,171 @@
+// =====================================================================
+// FEAT-03 · Auth · entity
+// ตรงกับ db/migration.sql ทุกคอลัมน์ · ชื่อใน DB เป็น snake_case
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------------------------------- enum
+enum SubjectKind {
+  MERCHANT_ADMIN
+  CUSTOMER
+  PLATFORM_ADMIN
+
+  @@map("subject_kind")
+}
+
+/// เพิกถอนแล้วต้องบอกเหตุผลเสมอ · CHECK ใน migration.sql บังคับไว้
+enum RevokeReason {
+  LOGOUT
+  ROTATED
+  REUSE_DETECTED
+  PASSWORD_CHANGED
+  ADMIN_REVOKED
+  EXPIRED
+
+  @@map("revoke_reason")
+}
+
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+
+  @@map("merchant_status")
+}
+
+// ------------------------------------------------------- ตัวตน (FEAT-01)
+model Merchant {
+  id        String         @id
+  name      String
+  status    MerchantStatus @default(PENDING)
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  admins MerchantAdmin[]
+
+  @@map("merchant")
+}
+
+model MerchantAdmin {
+  id              String    @id
+  merchantId      String    @map("merchant_id")
+  email           String
+  /// NFC + trim + lowercase · unique อยู่บนคอลัมน์นี้
+  emailNormalized String    @map("email_normalized")
+  /// argon2id PHC string · CHECK บังคับว่าต้องขึ้นต้น $argon2id$
+  passwordHash    String    @map("password_hash")
+  displayName     String    @map("display_name")
+  /// ปิดบัญชีแล้ว · ต้องเพิกถอน session ที่ยังใช้ได้ทั้งหมดด้วย (T14)
+  disabledAt      DateTime? @map("disabled_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastLoginAt     DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  merchant Merchant      @relation(fields: [merchantId], references: [id])
+  sessions AuthSession[]
+
+  @@unique([emailNormalized], map: "uq_admin_email")
+  @@map("merchant_admin")
+}
+
+model Customer {
+  id         String    @id
+  telHash    Bytes     @map("tel_hash")
+  disabledAt DateTime? @map("disabled_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  sessions AuthSession[]
+
+  @@unique([telHash], map: "uq_customer_tel")
+  @@map("customer")
+}
+
+// -------------------------------------------------------------- session
+/// RFD 16 §3.4 — refresh token เก็บเป็น sha256 เท่านั้น
+/// plaintext ไม่เคยอยู่ในตารางนี้ · พิสูจน์ด้วย tests/acceptance.sql T7
+///
+/// uq_session_parent (partial unique index ใน migration.sql) คือสิ่งที่
+/// ทำให้ token หนึ่งใบหมุนได้ครั้งเดียว · Prisma ประกาศ partial index ไม่ได้
+/// จึงอยู่ใน migration.sql เท่านั้น
+model AuthSession {
+  id               String        @id
+  subjectKind      SubjectKind   @map("subject_kind")
+  /// เจ้าของต้องเป็นคนใดคนหนึ่ง · CHECK num_nonnulls(...) = 1 บังคับไว้
+  merchantAdminId  String?       @map("merchant_admin_id")
+  customerId       String?       @map("customer_id")
+  /// สายของการหมุน · เพิกถอนทั้งสายพร้อมกันได้ด้วยคำสั่งเดียว
+  familyId         String        @map("family_id")
+  refreshTokenHash Bytes         @map("refresh_token_hash")
+  parentId         String?       @map("parent_id")
+  userAgentHash    Bytes?        @map("user_agent_hash")
+  ipHash           Bytes?        @map("ip_hash")
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt        DateTime      @map("expires_at") @db.Timestamptz(6)
+  /// ประทับเมื่อถูกใช้หมุน · ใช้แล้วใช้อีกไม่ได้
+  usedAt           DateTime?     @map("used_at") @db.Timestamptz(6)
+  revokedAt        DateTime?     @map("revoked_at") @db.Timestamptz(6)
+  revokedReason    RevokeReason? @map("revoked_reason")
+
+  merchantAdmin MerchantAdmin? @relation(fields: [merchantAdminId], references: [id])
+  customer      Customer?      @relation(fields: [customerId], references: [id])
+  parent        AuthSession?   @relation("Rotation", fields: [parentId], references: [id])
+  child         AuthSession?   @relation("Rotation")
+  events        AuthEvent[]
+
+  @@unique([refreshTokenHash], map: "uq_session_token")
+  @@unique([parentId], map: "uq_session_parent")
+  @@index([familyId], map: "ix_session_family")
+  @@index([subjectKind, merchantAdminId, customerId], map: "ix_session_subject")
+  @@index([expiresAt], map: "ix_session_live")
+  @@map("auth_session")
+}
+
+// -------------------------------------------------------- login attempt
+/// เก็บแต่ hash ไม่เก็บอีเมลหรือ IP ตรงๆ (T12)
+model LoginAttempt {
+  id             String   @id
+  identifierHash Bytes    @map("identifier_hash")
+  ipHash         Bytes    @map("ip_hash")
+  succeeded      Boolean
+  failureCode    String?  @map("failure_code")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([identifierHash, createdAt], map: "ix_attempt_identifier")
+  @@index([ipHash, createdAt], map: "ix_attempt_ip")
+  @@map("login_attempt")
+}
+
+model LoginLockout {
+  identifierHash Bytes    @id @map("identifier_hash")
+  lockedUntil    DateTime @map("locked_until") @db.Timestamptz(6)
+  attemptCount   Int      @map("attempt_count")
+  updatedAt      DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("login_lockout")
+}
+
+// ---------------------------------------------------------------- audit
+model AuthEvent {
+  id          String       @id
+  subjectKind SubjectKind? @map("subject_kind")
+  subjectId   String?      @map("subject_id")
+  /// LOGIN_OK · LOGIN_FAIL · REFRESH · LOGOUT · REUSE_DETECTED
+  kind        String
+  sessionId   String?      @map("session_id")
+  ipHash      Bytes?       @map("ip_hash")
+  metadata    Json         @default("{}")
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  session AuthSession? @relation(fields: [sessionId], references: [id])
+
+  @@index([subjectKind, subjectId, createdAt], map: "ix_auth_event_subject")
+  @@index([kind, createdAt], map: "ix_auth_event_kind")
+  @@map("auth_event")
+}

@@ -1,0 +1,139 @@
+erDiagram
+    psp_webhook ||--o{ thb_deposit : "ยืนยันด้วย"
+    psp_webhook ||--o{ deposit_reversal : "แจ้งตีกลับด้วย"
+    thb_deposit ||--o| thb_mint : "mint ครั้งเดียว"
+    thb_deposit ||--o| deposit_reversal : "ตีกลับครั้งเดียว"
+
+    operation ||--o| thb_mint : "งานที่สร้าง THB"
+    operation ||--o{ deposit_reversal : "งานที่เผาคืน"
+    operation ||--o{ ledger_entry : "การเคลื่อนเงิน · รวมได้ศูนย์"
+    operation ||--o{ operation_step : "หนึ่งขั้น"
+    operation ||--o{ outbox : "commit พร้อมกัน"
+    operation ||--o{ reservation : "เงินที่กันไว้"
+    operation ||--o{ operation_event : "ทุก transition"
+    operation ||--o| idempotency_key : "คำตอบที่เก็บไว้"
+    operation ||--o{ chain_event : "event ที่ตรงกัน"
+    chain_event ||--o{ thb_mint : "event ที่ยืนยันการ mint"
+    signer ||--o{ operation_step : "เซ็น"
+
+    merchant {
+        text id PK
+        merchant_status status
+    }
+
+    customer {
+        text id PK
+    }
+
+    psp_webhook {
+        text id PK
+        text provider
+        text provider_event_id "UNIQUE กับ provider · idempotency ตัวจริง"
+        bytea raw_body "แก้ไม่ได้ · เป็นหลักฐาน"
+        text signature "HMAC · ตรวจจาก body ดิบ"
+        boolean signature_ok "ไม่ผ่านก็ยังบันทึก แต่ไม่เข้าคิวงาน"
+        timestamptz processed_at "ช่องเดียวที่แก้ได้"
+    }
+
+    thb_deposit {
+        text id PK
+        holder_kind holder_kind
+        text holder_id
+        text provider_ref "UNIQUE กับ provider · ผู้ให้บริการเลือกค่านี้"
+        bigint amount_satang "หน่วยเงินบาทจริง 1 ส่วน 100"
+        numeric amount_base "หน่วยบน chain · สตางค์ คูณ 10 ยกกำลัง 16"
+        deposit_status status "ข้ามขั้นไม่ได้"
+        text webhook_id FK "ยืนยันแล้วต้องมี · ยืนยันเองลอยๆ ไม่ได้"
+        timestamptz confirmed_at
+        timestamptz minted_at
+    }
+
+    thb_mint {
+        text deposit_id PK "คีย์เป็น deposit_id · mint ได้ครั้งเดียว"
+        text operation_id FK "UNIQUE"
+        numeric amount_base "ต้องเท่ากับยอดที่ฝากพอดี"
+        ledger_account to_account "ต้องเป็นเจ้าของการฝาก"
+        text to_account_id
+        bytea tx_hash
+        bigint minted_block
+    }
+
+    deposit_reversal {
+        text id PK
+        text deposit_id FK "UNIQUE · ตีกลับได้ครั้งเดียว"
+        numeric amount_base
+        numeric available_at_reversal "ยอดที่ใช้ได้ตอนนั้น · บันทึกไว้"
+        reversal_outcome outcome "ต้องตรงกับยอดข้างบน · เลือกเองไม่ได้"
+        text note
+    }
+
+    thb_balance {
+        ledger_account account PK
+        text account_id PK
+        numeric amount "ติดลบได้เฉพาะ ISSUANCE"
+    }
+
+    ledger_entry {
+        text id PK
+        text operation_id FK "ผลรวมต่อ operation ต้องเป็นศูนย์"
+        integer entry_seq "UNIQUE กับ operation_id"
+        ledger_account account "ISSUANCE ได้จาก THB_MINT เท่านั้น"
+        text account_id
+        numeric amount "ลบคือออก บวกคือเข้า · ศูนย์ไม่ยอมรับ"
+    }
+
+    idempotency_key {
+        text id PK
+        text scope "UNIQUE กับ key"
+        bytea fingerprint "hash ตรงๆ · ห้าม HMAC (IK-23)"
+        jsonb response_body
+    }
+
+    operation {
+        text id PK
+        text actor_scope "system:minter หรือ system:psp"
+        operation_kind kind "THB_MINT"
+        operation_status status "uq_mint_inflight กันงานซ้อน"
+        text subject_id "deposit ที่เกี่ยวข้อง"
+    }
+
+    operation_step {
+        text id PK
+        integer step_index "1 เท่านั้น"
+        text name "mintTHB"
+        bytea raw_tx "R2 · commit ก่อน broadcast"
+        bytea tx_hash "UNIQUE"
+        step_status status
+    }
+
+    reservation {
+        text id PK
+        reservation_subject subject_type "THB_BALANCE"
+        text subject_id
+        numeric amount "f_available_thb ใช้คำนวณยอดที่เผาได้"
+        timestamptz released_at
+    }
+
+    outbox {
+        text id PK
+        text topic "thb.mint.v1"
+        timestamptz sent_at
+    }
+
+    operation_event {
+        text id PK
+        operation_status to_status
+        actor_type actor
+    }
+
+    signer {
+        bytea address PK
+        text key_ref "KMS · ไม่มี private key ในฐานข้อมูล"
+    }
+
+    chain_event {
+        text id PK
+        bytea tx_hash "UNIQUE กับ log_index"
+        integer log_index
+        bytea block_hash
+    }

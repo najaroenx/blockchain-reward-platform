@@ -1,0 +1,40 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> PENDING_PAYMENT : สร้างรายการฝาก
+
+    note right of PENDING_PAYMENT
+        ยังไม่มี THB เกิดขึ้น
+        mint จากสถานะนี้ = F4
+        ถูกปิดที่ trigger
+    end note
+
+    PENDING_PAYMENT --> FAILED : จ่ายไม่สำเร็จ
+    PENDING_PAYMENT --> EXPIRED : หมดเวลารอจ่าย
+    PENDING_PAYMENT --> CONFIRMED : webhook ยืนยัน · ลายเซ็นผ่าน · ยอดตรง
+
+    note right of CONFIRMED
+        เงินบาทเข้าแล้ว
+        สถานะเดียวที่ mint ได้
+        และต้องมี webhook_id อ้างอิง
+    end note
+
+    CONFIRMED --> MINTED : mintTHB FINALIZED
+    MINTED --> REVERSED : ถูกตีกลับ
+
+    note right of MINTED
+        ledger สองแถว รวมได้ศูนย์
+        ปลายทาง บวก · ISSUANCE ลบ
+        กลับไป CONFIRMED ไม่ได้
+    end note
+
+    note left of REVERSED
+        ยอดที่ใช้ได้พอ → เผาคืน
+        ยอดไม่พอ → MANUAL_REVIEW
+        ผลลัพธ์คำนวณจากยอดจริง
+        เลือกเองไม่ได้ทั้งสองทาง
+    end note
+
+    FAILED --> [*]
+    EXPIRED --> [*]
+    REVERSED --> [*]

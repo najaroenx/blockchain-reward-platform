@@ -1,0 +1,160 @@
+erDiagram
+    merchant ||--o{ coupon_type : "ออก"
+    coupon_type ||--o{ coupon_code : "มีใบ"
+    coupon_type ||--o{ listing : "ประเภทที่ขาย"
+
+    listing ||--o{ listing_item : "ประกอบด้วย"
+    coupon_code ||--o{ listing_item : "ถูกใส่ใน"
+    listing ||--o| listing_chain : "ผลจาก chain"
+    listing ||--o{ purchase : "ถูกซื้อ"
+
+    coupon_code ||--o| coupon_holding : "ใครถืออยู่"
+    chain_event ||--o{ coupon_holding : "event ที่ทำให้ย้าย"
+
+    operation ||--o{ ledger_entry : "การเคลื่อนเงิน · รวมได้ศูนย์"
+    operation ||--o{ purchase : "งานที่ทำให้เกิด"
+    operation ||--o{ operation_step : "สองขั้น"
+    operation ||--o{ outbox : "commit พร้อมกัน"
+    operation ||--o{ reservation : "ของและเงินที่กันไว้"
+    operation ||--o{ operation_event : "ทุก transition"
+    operation ||--o| idempotency_key : "คำตอบที่เก็บไว้"
+    operation ||--o{ chain_event : "event ที่ตรงกัน"
+    signer ||--o{ operation_step : "เซ็น"
+
+    merchant {
+        text id PK
+        merchant_status status
+    }
+
+    customer {
+        text id PK
+    }
+
+    coupon_type {
+        text id PK
+        numeric face_value "78 0"
+        timestamptz expires_at
+    }
+
+    coupon_code {
+        text id PK
+        coupon_code_state state
+        holder_kind holder_kind "เปลี่ยนเมื่อขายสำเร็จ"
+        text holder_id
+    }
+
+    listing {
+        text id PK
+        holder_kind seller_kind "trg_buy_admissible กันซื้อของตัวเอง"
+        text seller_id
+        numeric unit_price "แก้ไม่ได้หลังพ้น PENDING"
+        integer quantity "ซื้อทั้งใบเท่านั้น"
+        listing_status status "ซื้อได้เฉพาะ ACTIVE"
+    }
+
+    listing_item {
+        text id PK
+        text coupon_code_id FK "ใบที่ระบุเจาะจง"
+    }
+
+    listing_chain {
+        text listing_id PK
+        numeric chain_listing_id "แก้ไม่ได้"
+        listing_close_reason close_reason "SOLD เมื่อขายไป"
+    }
+
+    fee_schedule {
+        text id PK
+        integer bps "0 ถึง 10000"
+        timestamptz effective_from "UNIQUE · f_fee_bps_at หาตามเวลา"
+    }
+
+    purchase {
+        text id PK
+        text listing_id FK "UNIQUE เมื่อยังไม่ FAILED"
+        holder_kind buyer_kind
+        text buyer_id
+        numeric unit_price "คัดลอกมาตอนรับคำขอ"
+        numeric total_price "unit คูณ qty"
+        integer fee_bps "อัตราที่ใช้จริง · ไม่เปลี่ยนย้อนหลัง"
+        numeric fee_amount "ปัดลง"
+        numeric net_to_seller "total ลบ fee · เศษตกเป็นของผู้ขาย"
+        purchase_status status
+    }
+
+    thb_balance {
+        ledger_account account PK
+        text account_id PK "ACCOUNT:id · ตรงกับ subject_id ของการจอง"
+        numeric amount "ติดลบได้เฉพาะ ISSUANCE"
+    }
+
+    ledger_entry {
+        text id PK
+        text operation_id FK "ผลรวมต่อ operation ต้องเป็นศูนย์"
+        integer entry_seq "UNIQUE กับ operation_id"
+        ledger_account account
+        text account_id
+        numeric amount "ลบคือออก บวกคือเข้า · ศูนย์ไม่ยอมรับ"
+    }
+
+    coupon_holding {
+        text coupon_code_id PK
+        holder_kind holder_kind
+        text holder_id
+        text chain_event_id FK "NOT NULL · ไม่มี event ไม่มีการย้าย"
+    }
+
+    idempotency_key {
+        text id PK
+        text scope "UNIQUE กับ key"
+        bytea fingerprint "hash ตรงๆ · ห้าม HMAC"
+        jsonb response_body
+    }
+
+    operation {
+        text id PK
+        text actor_scope "มาจาก token ไม่ใช่จาก body"
+        operation_kind kind "LISTING_BUY"
+        operation_status status "uq_listing_inflight กันงานซ้อน"
+        text subject_id
+    }
+
+    operation_step {
+        text id PK
+        integer step_index "1 approveTHB · 2 executePurchase"
+        bytea raw_tx "R2 · commit ก่อน broadcast"
+        bytea tx_hash "UNIQUE"
+        step_status status "trg_step_order_gate บังคับลำดับ"
+    }
+
+    reservation {
+        text id PK
+        reservation_subject subject_type "THB_BALANCE บวกกันได้"
+        text subject_id "ACCOUNT:id"
+        numeric amount "เทียบกับ f_available_thb"
+        timestamptz released_at
+    }
+
+    outbox {
+        text id PK
+        text topic "listing.buy.v1"
+        timestamptz sent_at
+    }
+
+    operation_event {
+        text id PK
+        operation_status to_status
+        actor_type actor
+    }
+
+    signer {
+        bytea address PK
+        text key_ref "KMS · ไม่มี private key ในฐานข้อมูล"
+    }
+
+    chain_event {
+        text id PK
+        bytea tx_hash "UNIQUE กับ log_index"
+        integer log_index
+        bytea block_hash "เทียบซ้ำ ไม่ใช่นับความลึก"
+    }

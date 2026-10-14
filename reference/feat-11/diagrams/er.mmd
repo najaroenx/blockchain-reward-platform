@@ -1,0 +1,74 @@
+%%{init:{'theme':'base','themeVariables':{'fontFamily':'system-ui, -apple-system, Segoe UI, Noto Sans Thai, Loma, sans-serif','primaryColor':'#f2f4f6','primaryTextColor':'#1b1f24','primaryBorderColor':'#aeb4c2','lineColor':'#5c6672'}}}%%
+erDiagram
+    MERCHANT       ||--o{ COUPON_TYPE : "ออก"
+    COUPON_TYPE    ||--o{ COUPON_CODE : "มีหลายใบ"
+    COUPON_TYPE    ||--o{ COUPON_HOLDING : "สรุปยอดถือครอง"
+    CUSTOMER       ||--|| WALLET : "ถือ"
+    MERCHANT       ||--|| WALLET : "ถือ"
+    WALLET         ||--o{ ESCROW : "ผู้ขาย ผู้ซื้อ"
+    IDEMPOTENCY_KEY ||--o| OPERATION : "ชี้ไปที่"
+    OPERATION      ||--o{ OPERATION_STEP : "2 ขั้น"
+    OPERATION      ||--|| OUTBOX : "ปลุก worker"
+    OPERATION      ||--o{ RESERVATION : "กันของไว้"
+    OPERATION      ||--o{ OPERATION_EVENT : "ทุกการเปลี่ยน"
+    CHAIN_EVENT    ||--o| OPERATION_STEP : "จับคู่ด้วย tx_hash"
+
+    COUPON_CODE {
+        text id PK
+        text coupon_type_id FK
+        bytea code_hash UK "sha256 · ไม่เก็บ plaintext"
+        bytea code_ref UK "ส่งขึ้น chain"
+        enum state "ISSUED HELD REDEEMED EXPIRED VOIDED"
+        text holder_kind
+        text holder_id
+        timestamptz redeemed_at
+    }
+    OPERATION {
+        text id PK "op_ คือ operationId ใน 202"
+        text actor_scope
+        enum kind "COUPON_REDEEM"
+        enum status "PENDING..FINALIZED"
+        jsonb payload
+    }
+    OPERATION_STEP {
+        text id PK
+        text operation_id FK
+        int step_index "1 burn · 2 release"
+        text name
+        bytea signer_address
+        bigint nonce
+        bytea raw_tx "COMMIT ก่อน broadcast"
+        bytea tx_hash UK
+        enum status
+    }
+    RESERVATION {
+        text id PK
+        text operation_id FK
+        enum subject_type "COUPON_UNIT ESCROW"
+        text subject_id
+        numeric amount "78,0"
+        timestamptz released_at "null = ยังจองอยู่"
+    }
+    OUTBOX {
+        text id PK
+        text operation_id FK
+        text topic "operation.prepared.v1"
+        timestamptz sent_at "null = ยังไม่มีใครหยิบ"
+    }
+    ESCROW {
+        text id PK
+        numeric chain_token_id "78,0"
+        bytea contract_address
+        numeric total_amount "78,0"
+        numeric remaining_amount "78,0"
+        int coupons_locked
+        int coupons_redeemed
+        boolean active UK "active ได้ทีละก้อนต่อ token"
+    }
+    CHAIN_EVENT {
+        text id PK
+        bytea tx_hash UK
+        int log_index UK
+        bytea block_hash "เทียบซ้ำ ไม่นับความลึก"
+        timestamptz applied_at
+    }
