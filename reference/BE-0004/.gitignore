@@ -1,0 +1,4 @@
+data/singlenode/
+envs/*.env
+keystore/node1/key
+.env

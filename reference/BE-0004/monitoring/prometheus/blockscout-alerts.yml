@@ -1,0 +1,165 @@
+# Prometheus Alert Rules for Blockscout Services
+# ================================================
+groups:
+  # =====================
+  # Service Health Alerts
+  # =====================
+  - name: blockscout_service_alerts
+    rules:
+      # Alert if Backend is down
+      - alert: BlockscoutBackendDown
+        expr: up{job="blockscout-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: blockscout
+        annotations:
+          summary: "Blockscout Backend is DOWN"
+          description: "The Blockscout Backend API has been unreachable for more than 2 minutes."
+
+      # Alert if Indexer is down
+      - alert: BlockscoutIndexerDown
+        expr: up{job="blockscout-indexer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: blockscout
+        annotations:
+          summary: "Blockscout Indexer is DOWN"
+          description: "The Blockscout Indexer has been unreachable for more than 2 minutes. Block indexing is halted."
+
+      # Alert if Stats service is down
+      - alert: BlockscoutStatsDown
+        expr: up{job="blockscout-stats"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "Blockscout Stats Service is DOWN"
+          description: "The Blockscout Stats service has been unreachable for more than 5 minutes."
+
+      # Alert if Smart Contract Verifier is down
+      - alert: BlockscoutVerifierDown
+        expr: up{job="blockscout-smart-contract-verifier"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "Smart Contract Verifier is DOWN"
+          description: "The Smart Contract Verifier service has been unreachable for more than 5 minutes."
+
+  # =====================
+  # API Performance Alerts
+  # =====================
+  - name: blockscout_api_alerts
+    rules:
+      # Alert on high API error rate
+      - alert: BlockscoutHighErrorRate
+        expr: |
+          sum(rate(phoenix_controller_call_exception_total[5m])) /
+          sum(rate(phoenix_controller_call_duration_microseconds_count[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "High API error rate on Blockscout"
+          description: "Blockscout API is experiencing {{ $value | printf \"%.1f%%\" }} error rate."
+
+      # Alert on slow API responses
+      - alert: BlockscoutSlowAPI
+        expr: |
+          histogram_quantile(0.95, sum(rate(phoenix_controller_call_duration_microseconds_bucket[5m])) by (le)) / 1000 > 5000
+        for: 10m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "Slow API responses on Blockscout"
+          description: "95th percentile API response time is {{ $value | printf \"%.0fms\" }}, exceeding 5000ms threshold."
+
+  # =====================
+  # Database Alerts
+  # =====================
+  - name: blockscout_database_alerts
+    rules:
+      # Alert on slow database queries
+      - alert: BlockscoutSlowDatabaseQueries
+        expr: |
+          histogram_quantile(0.95, sum(rate(ecto_query_duration_microseconds_bucket[5m])) by (le)) / 1000 > 1000
+        for: 15m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "Slow database queries on Blockscout"
+          description: "95th percentile database query time is {{ $value | printf \"%.0fms\" }}, exceeding 1000ms threshold."
+
+      # Alert on high database query rate (possible issue)
+      - alert: BlockscoutHighDatabaseLoad
+        expr: sum(rate(ecto_query_duration_microseconds_count[5m])) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "High database query rate on Blockscout"
+          description: "Database query rate is {{ $value | printf \"%.0f\" }} queries/second."
+
+  # =====================
+  # Indexer Alerts
+  # =====================
+  - name: blockscout_indexer_alerts
+    rules:
+      # Alert if indexing is stuck
+      - alert: BlockscoutIndexingStuck
+        expr: increase(indexer_blocks_indexed_total[15m]) == 0 and up{job="blockscout-indexer"} == 1
+        for: 15m
+        labels:
+          severity: critical
+          service: blockscout
+        annotations:
+          summary: "Blockscout indexing is stuck"
+          description: "No blocks have been indexed in the last 15 minutes while the indexer is running."
+
+      # Alert on indexer lag (behind blockchain)
+      - alert: BlockscoutIndexerLag
+        expr: |
+          (besu_blockchain_height - on() indexer_latest_block) > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "Blockscout indexer is lagging behind"
+          description: "Indexer is {{ $value }} blocks behind the blockchain head."
+
+  # =====================
+  # Memory Alerts
+  # =====================
+  - name: blockscout_memory_alerts
+    rules:
+      # Alert on high BEAM memory usage
+      - alert: BlockscoutHighMemory
+        expr: erlang_vm_memory_bytes_total{kind="processes"} > 4e9
+        for: 15m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "High memory usage on Blockscout"
+          description: "Blockscout process memory is {{ $value | humanize }} bytes."
+
+      # Alert on potential memory leak
+      - alert: BlockscoutMemoryLeak
+        expr: |
+          rate(erlang_vm_memory_bytes_total{kind="processes"}[1h]) > 10000000
+        for: 30m
+        labels:
+          severity: warning
+          service: blockscout
+        annotations:
+          summary: "Possible memory leak on Blockscout"
+          description: "Memory is increasing at {{ $value | printf \"%.0f\" }} bytes/second."

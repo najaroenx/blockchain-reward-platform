@@ -1,0 +1,23 @@
+sync-min-peers = 0
+
+[data]
+genesis-file = "/config/genesis.json"
+data-path = "/var/lib/besu"
+data-storage-format = "BONSAI"
+
+[rpc]
+rpc-http-enabled = true
+rpc-http-host = "0.0.0.0"
+rpc-http-api = [
+    "ETH",
+    "NET",
+    "WEB3",
+    "QBFT",
+]
+
+[p2p]
+p2p-interface = "0.0.0.0"
+p2p-port = 30303
+
+[txpool]
+tx-pool-no-local-priority = true

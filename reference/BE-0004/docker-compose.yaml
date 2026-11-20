@@ -1,0 +1,337 @@
+x-besu:
+  &besu
+  image: bubbleentroni/besu:v26.9
+  pull_policy: never
+  restart: unless-stopped
+  # IMPORTANT: Allow graceful shutdown to prevent world state corruption
+  stop_grace_period: 2m
+  # Ensure proper shutdown signal
+  stop_signal: SIGTERM
+
+services:
+  besu-node:
+    <<: *besu
+    hostname: node1-single-node-validator
+    volumes:
+      - "./config/genesis-single-node.json:/config/genesis.json"
+      - "./config/conf_init-single-node.toml:/config/conf.toml"
+      - "./keystore/node1/key:/config/key"
+      - "./data/singlenode:/var/lib/besu"
+    command:
+      - --genesis-file=/config/genesis.json
+      - --config-file=/config/conf.toml
+      - --node-private-key-file=/config/key
+      - --rpc-http-port=8545
+      - --p2p-port=30303
+      - --tx-pool-enable-balance-check=false
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "127.0.0.1:8545:8545"
+
+
+  # --- BLOCKSCOUT DATABASE ---
+
+  blockscout-db:
+    image: postgres:14-alpine
+    container_name: blockscout_db
+    hostname: blockscout-db
+    env_file:
+      - ./envs/common-db.env
+    command: postgres -c max_connections=300
+    volumes:
+      - blockscout_db_data:/var/lib/postgresql/data
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  reward-db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${REWARD_POSTGRES_PASSWORD:?Set REWARD_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: reward
+    ports:
+      - "5433:5432"
+    volumes:
+      - reward_db_data:/var/lib/postgresql/data
+    networks:
+      - loaffinity-singlenode
+
+  adminer:
+    image: adminer
+    depends_on:
+      - reward-db
+    ports:
+      - "8080:8080"
+    networks:
+      - loaffinity-singlenode
+
+  # --- BLOCKSCOUT RUST SERVICES ---
+
+  stats-db:
+    image: postgres:14-alpine
+    container_name: stats_db
+    environment:
+      POSTGRES_DB: stats
+      POSTGRES_USER: stats
+      POSTGRES_PASSWORD: ${STATS_POSTGRES_PASSWORD:?Set STATS_POSTGRES_PASSWORD in .env}
+    volumes:
+      - stats_db_data:/var/lib/postgresql/data
+    networks:
+      - loaffinity-singlenode
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U stats" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  stats:
+    platform: linux/amd64
+    image: ghcr.io/blockscout/stats:latest
+    container_name: blockscout_stats
+    depends_on:
+      stats-db:
+        condition: service_healthy
+      blockscout-backend:
+        condition: service_healthy
+    env_file:
+      - ./envs/stats.env
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "8050:8050"
+    restart: on-failure
+
+  visualizer:
+    platform: linux/amd64
+    image: ghcr.io/blockscout/visualizer:latest
+    container_name: blockscout_visualizer
+    environment:
+      - VISUALIZER__SERVER__HTTP__ADDR=0.0.0.0:8051
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "8051:8051"
+
+  sig-provider:
+    platform: linux/amd64
+    image: ghcr.io/blockscout/sig-provider:latest
+    container_name: blockscout_sig_provider
+    environment:
+      - SIG_PROVIDER__SERVER__HTTP__ADDR=0.0.0.0:8052
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "8052:8052"
+
+  smart-contract-verifier:
+    image: ghcr.io/blockscout/smart-contract-verifier:latest
+    platform: linux/amd64
+    restart: on-failure
+    container_name: blockscout_smart_contract_verifier
+    environment:
+      - SMART_CONTRACT_VERIFIER__SERVER__HTTP__ADDR=0.0.0.0:8043
+      - SMART_CONTRACT_VERIFIER__SOLIDITY__ENABLED=true
+      - SMART_CONTRACT_VERIFIER__VYPER__ENABLED=true
+      - SMART_CONTRACT_VERIFIER__SOURCIFY__ENABLED=true
+      - SMART_CONTRACT_VERIFIER__ZKSYNC_SOLIDITY__ENABLED=false
+      - SMART_CONTRACT_VERIFIER__SOLIDITY__FETCHER__LIST__LIST_URL=http://binaries.soliditylang.org/linux-amd64/list.json
+      # Enable Prometheus metrics
+      - SMART_CONTRACT_VERIFIER__METRICS__ENABLED=true
+      - SMART_CONTRACT_VERIFIER__METRICS__ADDR=0.0.0.0:6060
+      - SMART_CONTRACT_VERIFIER__METRICS__ROUTE=/metrics
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "8043:8043"
+      - "6060:6060" # Prometheus metrics
+
+  # --- BLOCKSCOUT INDEXER ---
+
+  blockscout-indexer:
+    image: bubbleentroni/blockscout-custom:latest
+    # image: blockscout:v9
+    container_name: blockscout_indexer
+    restart: on-failure
+    hostname: blockscout-indexer
+    env_file:
+      - ./envs/common-blockscout.env
+    # command: sh -c "cp /app/releases/config_helper.exs /app/releases/9.3.2/config_helper.exs && bin/blockscout start"
+    command: sh -c "cp /app/releases/config_helper.exs /app/releases/9.3.2/config_helper.exs && bin/blockscout start"
+    volumes:
+      - "./config/config_helper.exs:/app/releases/config_helper.exs"
+    depends_on:
+      blockscout-db:
+        condition: service_healthy
+      besu-node:
+        condition: service_started
+    networks:
+      - loaffinity-singlenode
+    environment:
+      # **CRITICAL**: This is what runs the indexer tasks
+      - ETHEREUM_JSONRPC_HTTP_URL=http://besu-node:8545
+      - ETHEREUM_JSONRPC_WS_URL=ws://besu-node:8546
+      - ETHEREUM_JSONRPC_TRACE_URL=http://besu-node:8545
+      - BLOCK_TRANSFORMER_CONCURRENCY=1
+      # Increase DB connection pool size for Indexer
+      - POOL_SIZE=80
+      - ETC_SYNC_INTERVAL=1000
+      - EIP1559_SUPPORTED=true
+      - POISON_PILL_BLOCKS_GAP=10000
+      - POISON_PILL_BLOCKS_AMOUNT=1000
+  # --- BLOCKSCOUT BACKEND (Still needed for DB and indexing) ---
+
+  blockscout-backend:
+    image: bubbleentroni/blockscout-custom:latest
+    # image: blockscout:v9
+    container_name: blockscout_backend
+    hostname: blockscout-backend
+    env_file:
+      - ./envs/common-blockscout.env
+    # command: sh -c "cp /app/releases/config_helper.exs /app/releases/9.3.2/config_helper.exs && bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    command: sh -c "cp /app/releases/config_helper.exs /app/releases/9.3.2/config_helper.exs && bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    volumes:
+      - "./config/config_helper.exs:/app/releases/config_helper.exs"
+    # command: bin/blockscout start
+    depends_on:
+      blockscout-db:
+        condition: service_healthy
+      besu-node:
+        condition: service_started
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "4000:4000"
+    environment:
+      - ETHEREUM_JSONRPC_HTTP_URL=http://besu-node:8545
+      - ETHEREUM_JSONRPC_WS_URL=ws://besu-node:8546
+      - ETHEREUM_JSONRPC_TRACE_URL=http://besu-node:8545
+      - POOL_SIZE=50
+      - DISABLE_SYNC=false
+      - NO_INDEXER=true
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://127.0.0.1:4000/api/v2/stats" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # --- BLOCKSCOUT FRONTEND ---
+
+  blockscout-frontend:
+    # image: ghcr.io/blockscout/frontend:latest
+    # image: frontend:v2
+    image: bubbleentroni/blockscout-frontend:v2
+    container_name: blockscout_frontend
+    hostname: blockscout-frontend
+    env_file:
+      - ./envs/common-frontend.env
+    depends_on:
+      - blockscout-backend
+      - stats
+      - visualizer
+      - sig-provider
+      - smart-contract-verifier
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "80:3000"
+
+  # --- MONITORING STACK ---
+
+  prometheus:
+    image: prom/prometheus:v2.47.2
+    container_name: prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=30d'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/blockscout-alerts.yml:/etc/prometheus/rules/blockscout-alerts.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "9090:9090"
+    depends_on:
+      - blockscout-backend
+      - blockscout-indexer
+      - stats
+    labels:
+      - "service.type=monitoring"
+      - "service.name=prometheus"
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana
+    hostname: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    labels:
+      - "service.type=monitoring"
+      - "service.name=grafana"
+
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: alertmanager
+    hostname: alertmanager
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - loaffinity-singlenode
+    ports:
+      - "9093:9093"
+    labels:
+      - "service.type=monitoring"
+      - "service.name=alertmanager"
+
+networks:
+  loaffinity-singlenode:
+    name: loaffinity-singlenode
+    driver: bridge
+
+volumes:
+  blockscout_db_data:
+    driver: local
+  reward_db_data:
+    driver: local
+  stats_db_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  alertmanager_data:
+    driver: local
